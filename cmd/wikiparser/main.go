@@ -120,6 +120,24 @@ func (stdoutSink) Send(ctx context.Context, key, value []byte) error {
 		fmt.Printf("stdout sink %s (%d bytes) decode error: %v\n", string(key), len(value), err)
 		return nil
 	}
-	fmt.Printf("stdout sink: %s (%d bytes)\n", page.SrcURL, len(page.Content))
+	payload := struct {
+		SrcURL   string            `json:"src_url"`
+		HTTPCode uint32            `json:"http_code"`
+		Headers  map[string]string `json:"headers,omitempty"`
+		Content  string            `json:"content"`
+		IP       uint32            `json:"ip"`
+	}{
+		SrcURL:   page.SrcURL,
+		HTTPCode: page.HTTPCode,
+		Headers:  page.Headers,
+		Content:  string(page.Content),
+		IP:       page.IP,
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		fmt.Printf("stdout sink %s (%d bytes) json encode error: %v\n", string(key), len(value), err)
+		return nil
+	}
+	fmt.Printf("stdout sink %s:\n%s\n", string(key), data)
 	return nil
 }

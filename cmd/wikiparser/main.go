@@ -127,6 +127,6 @@ func (stdoutSink) Send(ctx context.Context, key, value []byte) error {
 		fmt.Printf("stdout sink %s (%d bytes) json encode error: %v\n", string(key), len(value), err)
 		return nil
 	}
-	fmt.Printf("stdout sink %s:\n%s\n", string(key), data)
+	fmt.Printf("stdout sink %s %s:\n%s\n", string(key), data, string(page.Content))
 	return nil
 }

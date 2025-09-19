@@ -5,6 +5,7 @@ import (
 	"compress/bzip2"
 	"compress/gzip"
 	"context"
+	"encoding/binary"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -39,7 +40,7 @@ var wikipediaAddr = func() uint32 {
 	if ip == nil {
 		return 0
 	}
-	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
+	return binary.BigEndian.Uint32(ip)
 }()
 
 var (

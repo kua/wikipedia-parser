@@ -3,7 +3,7 @@ package pageproto
 import (
 	"google.golang.org/protobuf/proto"
 
-	"github.com/example/wikipedia-parser/internal/pb"
+	"github.com/example/wikipedia-parser/proto"
 )
 
 type Page = pb.Page

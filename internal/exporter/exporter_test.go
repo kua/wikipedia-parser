@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -33,7 +34,7 @@ func (m *memorySink) Send(ctx context.Context, key, value []byte) error {
 
 func TestServiceRun(t *testing.T) {
 	tmp := t.TempDir()
-	xml := `<mediawiki><page><title>Foo Bar</title><revision><text>hello</text></revision></page><page><title>Baz</title><revision><text>world</text></revision></page></mediawiki>`
+	xml := `<mediawiki><page><title>Foo Bar</title><revision><text>See [[Main Page|main page]] and [https://example.com example]</text></revision></page><page><title>Baz</title><revision><text>Link to [[Baz]]</text></revision></page></mediawiki>`
 	gzData := gzipData([]byte(xml))
 
 	type requestLog struct {
@@ -87,6 +88,17 @@ func TestServiceRun(t *testing.T) {
 	}
 	if sink.pages[0].GetHttpCode() != 200 || sink.pages[0].GetIp() == 0 {
 		t.Fatalf("unexpected page fields: %+v", sink.pages[0])
+	}
+	content := string(sink.pages[0].GetContent())
+	if !strings.Contains(content, `<a href="https://en.wikipedia.org/wiki/Main_Page">main page</a>`) {
+		t.Fatalf("unexpected html content: %s", content)
+	}
+	if !strings.Contains(content, `<a href="https://example.com">example</a>`) {
+		t.Fatalf("missing external link: %s", content)
+	}
+	ruContent := string(sink.pages[2].GetContent())
+	if !strings.Contains(ruContent, `<a href="https://ru.wikipedia.org/wiki/Main_Page">main page</a>`) {
+		t.Fatalf("unexpected language conversion: %s", ruContent)
 	}
 
 	list := svc.List()

@@ -25,6 +25,7 @@ import (
 
 	"github.com/example/wikipedia-parser/internal/config"
 	"github.com/example/wikipedia-parser/internal/pageproto"
+	"github.com/example/wikipedia-parser/internal/wikihtml"
 )
 
 const (
@@ -629,10 +630,11 @@ func (s *Service) processDump(ctx context.Context, path string, file DumpFile) e
 		if title == "" {
 			continue
 		}
+		html := wikihtml.Convert(file.Language, page.Revision.Text.Value)
 		payload := &pageproto.Page{
 			SrcUrl:   buildPageURL(file.Language, title),
 			HttpCode: 200,
-			Content:  []byte(page.Revision.Text.Value),
+			Content:  []byte(html),
 			Ip:       wikipediaIP(),
 		}
 		data, err := pageproto.Marshal(payload)

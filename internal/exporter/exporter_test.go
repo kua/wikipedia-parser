@@ -17,7 +17,7 @@ import (
 
 type memorySink struct {
 	mu    sync.Mutex
-	pages []pageproto.Page
+	pages []*pageproto.Page
 }
 
 func (m *memorySink) Send(ctx context.Context, key, value []byte) error {
@@ -82,10 +82,10 @@ func TestServiceRun(t *testing.T) {
 	if len(sink.pages) != 4 {
 		t.Fatalf("expected 4 pages, got %d", len(sink.pages))
 	}
-	if sink.pages[0].SrcURL != "https://en.wikipedia.org/wiki/Foo_Bar" {
-		t.Fatalf("unexpected src url: %s", sink.pages[0].SrcURL)
+	if sink.pages[0].GetSrcUrl() != "https://en.wikipedia.org/wiki/Foo_Bar" {
+		t.Fatalf("unexpected src url: %s", sink.pages[0].GetSrcUrl())
 	}
-	if sink.pages[0].HTTPCode != 200 || sink.pages[0].IP == 0 {
+	if sink.pages[0].GetHttpCode() != 200 || sink.pages[0].GetIp() == 0 {
 		t.Fatalf("unexpected page fields: %+v", sink.pages[0])
 	}
 

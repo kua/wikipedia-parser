@@ -14,6 +14,7 @@ import (
 	"github.com/example/wikipedia-parser/internal/config"
 	"github.com/example/wikipedia-parser/internal/exporter"
 	"github.com/example/wikipedia-parser/internal/pageproto"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func main() {
@@ -120,20 +121,8 @@ func (stdoutSink) Send(ctx context.Context, key, value []byte) error {
 		fmt.Printf("stdout sink %s (%d bytes) decode error: %v\n", string(key), len(value), err)
 		return nil
 	}
-	payload := struct {
-		SrcURL   string            `json:"src_url"`
-		HTTPCode uint32            `json:"http_code"`
-		Headers  map[string]string `json:"headers,omitempty"`
-		Content  string            `json:"content"`
-		IP       uint32            `json:"ip"`
-	}{
-		SrcURL:   page.SrcURL,
-		HTTPCode: page.HTTPCode,
-		Headers:  page.Headers,
-		Content:  string(page.Content),
-		IP:       page.IP,
-	}
-	data, err := json.MarshalIndent(payload, "", "  ")
+	opts := protojson.MarshalOptions{UseProtoNames: true, Multiline: true, Indent: "  "}
+	data, err := opts.Marshal(page)
 	if err != nil {
 		fmt.Printf("stdout sink %s (%d bytes) json encode error: %v\n", string(key), len(value), err)
 		return nil

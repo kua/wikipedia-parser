@@ -629,11 +629,11 @@ func (s *Service) processDump(ctx context.Context, path string, file DumpFile) e
 		if title == "" {
 			continue
 		}
-		payload := pageproto.Page{
-			SrcURL:   buildPageURL(file.Language, title),
-			HTTPCode: 200,
+		payload := &pageproto.Page{
+			SrcUrl:   buildPageURL(file.Language, title),
+			HttpCode: 200,
 			Content:  []byte(page.Revision.Text.Value),
-			IP:       wikipediaIP(),
+			Ip:       wikipediaIP(),
 		}
 		data, err := pageproto.Marshal(payload)
 		if err != nil {

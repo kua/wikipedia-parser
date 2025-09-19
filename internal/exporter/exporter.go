@@ -20,6 +20,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/example/wikipedia-parser/internal/config"
 	"github.com/example/wikipedia-parser/internal/pageproto"
 )
@@ -88,12 +91,133 @@ type metricsState struct {
 	ReadErrors         int
 }
 
+type promMetrics struct {
+	handler        http.Handler
+	progress       prometheus.Gauge
+	elapsed        prometheus.Gauge
+	eta            prometheus.Gauge
+	processedFiles prometheus.Gauge
+	totalFiles     prometheus.Gauge
+	processedLangs prometheus.Gauge
+	totalLangs     prometheus.Gauge
+	processedPages prometheus.Gauge
+	downloadErrors prometheus.Gauge
+	readErrors     prometheus.Gauge
+	status         *prometheus.GaugeVec
+	states         []string
+}
+
+func newPromMetrics() *promMetrics {
+	progress := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "exporter_progress",
+		Help: "Overall progress",
+	})
+	elapsed := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "exporter_elapsed_seconds",
+		Help: "Elapsed time in seconds",
+	})
+	eta := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "exporter_eta_seconds",
+		Help: "Estimated time to finish in seconds",
+	})
+	processedFiles := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "exporter_processed_files",
+		Help: "Processed files",
+	})
+	totalFiles := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "exporter_total_files",
+		Help: "Total files",
+	})
+	processedLangs := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "exporter_processed_languages",
+		Help: "Processed languages",
+	})
+	totalLangs := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "exporter_total_languages",
+		Help: "Total languages",
+	})
+	processedPages := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "exporter_processed_pages",
+		Help: "Processed pages",
+	})
+	downloadErrors := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "exporter_download_errors",
+		Help: "Download errors",
+	})
+	readErrors := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "exporter_read_errors",
+		Help: "Read errors",
+	})
+	status := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "exporter_status",
+		Help: "Exporter status",
+	}, []string{"state"})
+
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(
+		progress,
+		elapsed,
+		eta,
+		processedFiles,
+		totalFiles,
+		processedLangs,
+		totalLangs,
+		processedPages,
+		downloadErrors,
+		readErrors,
+		status,
+	)
+
+	states := []string{"idle", "running", "paused", "completed", "aborted"}
+	for _, st := range states {
+		status.WithLabelValues(st).Set(0)
+	}
+	status.WithLabelValues("idle").Set(1)
+
+	return &promMetrics{
+		handler:        promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
+		progress:       progress,
+		elapsed:        elapsed,
+		eta:            eta,
+		processedFiles: processedFiles,
+		totalFiles:     totalFiles,
+		processedLangs: processedLangs,
+		totalLangs:     totalLangs,
+		processedPages: processedPages,
+		downloadErrors: downloadErrors,
+		readErrors:     readErrors,
+		status:         status,
+		states:         states,
+	}
+}
+
+func (m *promMetrics) update(state metricsState) {
+	m.progress.Set(state.Progress)
+	m.elapsed.Set(state.Elapsed.Seconds())
+	m.eta.Set(state.ETA.Seconds())
+	m.processedFiles.Set(float64(state.ProcessedFiles))
+	m.totalFiles.Set(float64(state.TotalFiles))
+	m.processedLangs.Set(float64(state.ProcessedLanguages))
+	m.totalLangs.Set(float64(state.TotalLanguages))
+	m.processedPages.Set(float64(state.ProcessedPages))
+	m.downloadErrors.Set(float64(state.DownloadErrors))
+	m.readErrors.Set(float64(state.ReadErrors))
+	for _, st := range m.states {
+		value := 0.0
+		if state.Status == st {
+			value = 1
+		}
+		m.status.WithLabelValues(st).Set(value)
+	}
+}
+
 type Service struct {
 	cfg    config.Config
 	client *http.Client
 	sink   Sink
 	lister DumpLister
 	status *statusFile
+	prom   *promMetrics
 
 	mu        sync.Mutex
 	cond      *sync.Cond
@@ -119,6 +243,7 @@ func NewService(cfg config.Config, client *http.Client, sink Sink) *Service {
 }
 
 func NewServiceWithLister(cfg config.Config, client *http.Client, sink Sink, lister DumpLister) *Service {
+	prom := newPromMetrics()
 	svc := &Service{
 		cfg:     cfg,
 		client:  client,
@@ -126,8 +251,10 @@ func NewServiceWithLister(cfg config.Config, client *http.Client, sink Sink, lis
 		lister:  lister,
 		status:  newStatusFile(cfg.StatusFile),
 		metrics: metricsState{Status: "idle"},
+		prom:    prom,
 	}
 	svc.cond = sync.NewCond(&svc.mu)
+	prom.update(svc.metrics)
 	return svc
 }
 
@@ -270,60 +397,41 @@ func (s *Service) ListAll(ctx context.Context) (ListAllResult, error) {
 
 func (s *Service) MetricsHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		s.mu.Lock()
-		m := s.metrics
-		if s.running {
-			elapsed := time.Since(s.startTime)
-			m.Elapsed = elapsed
-			if m.ProcessedFiles > 0 && m.TotalFiles > 0 {
-				perFile := elapsed / time.Duration(m.ProcessedFiles)
-				remaining := m.TotalFiles - m.ProcessedFiles
-				if remaining > 0 {
-					m.ETA = time.Duration(int64(perFile) * int64(remaining))
-				} else {
-					m.ETA = 0
-				}
+		snapshot := s.snapshotMetrics()
+		s.prom.update(snapshot)
+		s.prom.handler.ServeHTTP(w, r)
+	})
+}
+
+func (s *Service) snapshotMetrics() metricsState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	m := s.metrics
+	m.Progress = s.progress()
+	m.ProcessedPages = s.pages
+	m.DownloadErrors = s.downloadErrs
+	m.ReadErrors = s.readErrs
+	if s.running {
+		elapsed := time.Since(s.startTime)
+		m.Elapsed = elapsed
+		if m.ProcessedFiles > 0 && m.TotalFiles > 0 {
+			perFile := elapsed / time.Duration(m.ProcessedFiles)
+			remaining := m.TotalFiles - m.ProcessedFiles
+			if remaining > 0 {
+				m.ETA = time.Duration(int64(perFile) * int64(remaining))
 			} else {
 				m.ETA = 0
 			}
-			m.Progress = s.progress()
-			m.ProcessedPages = s.pages
-			m.DownloadErrors = s.downloadErrs
-			m.ReadErrors = s.readErrs
+		} else {
+			m.ETA = 0
 		}
-		s.mu.Unlock()
-
-		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		fmt.Fprintf(w, "# HELP exporter_progress Overall progress\n")
-		fmt.Fprintf(w, "# TYPE exporter_progress gauge\nexporter_progress %f\n", m.Progress)
-		fmt.Fprintf(w, "# HELP exporter_elapsed_seconds Elapsed time in seconds\n")
-		fmt.Fprintf(w, "# TYPE exporter_elapsed_seconds gauge\nexporter_elapsed_seconds %.0f\n", m.Elapsed.Seconds())
-		fmt.Fprintf(w, "# HELP exporter_eta_seconds Estimated time to finish in seconds\n")
-		fmt.Fprintf(w, "# TYPE exporter_eta_seconds gauge\nexporter_eta_seconds %.0f\n", m.ETA.Seconds())
-		fmt.Fprintf(w, "# HELP exporter_processed_files Processed files\n")
-		fmt.Fprintf(w, "# TYPE exporter_processed_files gauge\nexporter_processed_files %d\n", m.ProcessedFiles)
-		fmt.Fprintf(w, "# HELP exporter_total_files Total files\n")
-		fmt.Fprintf(w, "# TYPE exporter_total_files gauge\nexporter_total_files %d\n", m.TotalFiles)
-		fmt.Fprintf(w, "# HELP exporter_processed_languages Processed languages\n")
-		fmt.Fprintf(w, "# TYPE exporter_processed_languages gauge\nexporter_processed_languages %d\n", m.ProcessedLanguages)
-		fmt.Fprintf(w, "# HELP exporter_total_languages Total languages\n")
-		fmt.Fprintf(w, "# TYPE exporter_total_languages gauge\nexporter_total_languages %d\n", m.TotalLanguages)
-		fmt.Fprintf(w, "# HELP exporter_processed_pages Processed pages\n")
-		fmt.Fprintf(w, "# TYPE exporter_processed_pages counter\nexporter_processed_pages %d\n", m.ProcessedPages)
-		fmt.Fprintf(w, "# HELP exporter_download_errors Download errors\n")
-		fmt.Fprintf(w, "# TYPE exporter_download_errors counter\nexporter_download_errors %d\n", m.DownloadErrors)
-		fmt.Fprintf(w, "# HELP exporter_read_errors Read errors\n")
-		fmt.Fprintf(w, "# TYPE exporter_read_errors counter\nexporter_read_errors %d\n", m.ReadErrors)
-		fmt.Fprintf(w, "# HELP exporter_status Exporter status\n# TYPE exporter_status gauge\n")
-		states := []string{"idle", "running", "paused", "completed", "aborted"}
-		for _, st := range states {
-			value := 0
-			if m.Status == st {
-				value = 1
-			}
-			fmt.Fprintf(w, "exporter_status{state=\"%s\"} %d\n", st, value)
-		}
-	})
+	} else {
+		m.Elapsed = 0
+		m.ETA = 0
+	}
+	s.metrics = m
+	return m
 }
 
 func (s *Service) Wait() {

@@ -721,9 +721,9 @@ type pageJob struct {
 }
 
 func (s *Service) renderAndSendPage(ctx context.Context, lang, title, text string) error {
-	html, err := s.renderPage(ctx, title, text)
+	html, err := s.renderPage(ctx, lang, title, text)
 	if err != nil {
-		return err
+		return fmt.Errorf("render %s/%s: %w", lang, title, err)
 	}
 	payload := &pageproto.Page{
 		SrcUrl:   buildPageURL(lang, title),
@@ -756,7 +756,7 @@ func (s *Service) renderAndSendPage(ctx context.Context, lang, title, text strin
 	}
 }
 
-func (s *Service) renderPage(ctx context.Context, title, text string) ([]byte, error) {
+func (s *Service) renderPage(ctx context.Context, lang, title, text string) ([]byte, error) {
 	if strings.TrimSpace(text) == "" {
 		return []byte{}, nil
 	}
@@ -775,6 +775,7 @@ func (s *Service) renderPage(ctx context.Context, title, text string) ([]byte, e
 	}
 	req.Header.Set("User-Agent", chromeUA)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -782,12 +783,20 @@ func (s *Service) renderPage(ctx context.Context, title, text string) ([]byte, e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("mediawiki render status %s", resp.Status)
+		return nil, fmt.Errorf("mediawiki render status %s for %s/%s", resp.Status, lang, title)
 	}
 
 	var parsed mediaWikiParseResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
 		return nil, err
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		snippet := strings.TrimSpace(string(body))
+		if len(snippet) > 512 {
+			snippet = snippet[:512] + "..."
+		}
+		return nil, fmt.Errorf("mediawiki render decode error for %s/%s: %w (body snippet: %q)", lang, title, err, snippet)
 	}
 	if parsed.Error != nil {
 		return nil, fmt.Errorf("mediawiki render error %s: %s", parsed.Error.Code, parsed.Error.Info)

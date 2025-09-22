@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -101,8 +103,26 @@ func TestServiceRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("status file read: %v", err)
 	}
-	if !bytes.Contains(data, []byte("enwiki-latest-pages-articles1.xml-p1p2.gz")) {
-		t.Fatalf("status file missing entry: %s", string(data))
+	var state exportState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("status decode: %v", err)
+	}
+	if len(state.Pending) != 0 {
+		t.Fatalf("expected no pending items, got %v", state.Pending)
+	}
+	if len(state.Completed) != 2 {
+		t.Fatalf("expected 2 completed items, got %v", state.Completed)
+	}
+	if _, ok := state.Files["enwiki-latest-pages-articles1.xml-p1p2.gz"]; !ok {
+		t.Fatalf("status missing enwiki file: %+v", state.Files)
+	}
+	for _, name := range []string{
+		"enwiki-latest-pages-articles1.xml-p1p2.gz",
+		"ruwiki-latest-pages-articles1.xml-p1p2.gz",
+	} {
+		if _, err := os.Stat(filepath.Join(tmp, name)); err == nil || !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("dump file still present %s: %v", name, err)
+		}
 	}
 
 	if agent := reqLog.agent["/conf/dblists/wikipedia.dblist"]; agent != chromeUA {
@@ -126,8 +146,8 @@ func TestServiceRun(t *testing.T) {
 		t.Fatalf("restart: %v", err)
 	}
 	svc2.Wait()
-	if len(sink.pages) != 4 {
-		t.Fatalf("expected no new pages on restart, got %d", len(sink.pages))
+	if len(sink.pages) != 8 {
+		t.Fatalf("expected pages to be re-exported, got %d", len(sink.pages))
 	}
 }
 

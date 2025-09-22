@@ -1,8 +1,9 @@
 package exporter
 
 import (
-	"bufio"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -17,9 +18,9 @@ func newStatusFile(path string) *statusFile {
 	return &statusFile{path: path}
 }
 
-func (s *statusFile) Load() (map[string]bool, error) {
+func (s *statusFile) Load() (exportState, error) {
 	if s == nil || s.path == "" {
-		return map[string]bool{}, nil
+		return exportState{}, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -27,43 +28,51 @@ func (s *statusFile) Load() (map[string]bool, error) {
 	file, err := os.Open(s.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return map[string]bool{}, nil
+			return exportState{}, nil
 		}
-		return nil, err
+		return exportState{}, err
 	}
 	defer file.Close()
 
-	result := make(map[string]bool)
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
+	var state exportState
+	if err := json.NewDecoder(file).Decode(&state); err != nil {
+		if errors.Is(err, io.EOF) {
+			return exportState{}, nil
 		}
-		result[line] = true
+		return exportState{}, err
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
+	if state.Files == nil {
+		state.Files = map[string]DumpFile{}
 	}
-	return result, nil
+	return state, nil
 }
 
-func (s *statusFile) Append(name string) error {
+func (s *statusFile) Save(state exportState) error {
 	if s == nil || s.path == "" {
 		return nil
 	}
+	if state.Files == nil {
+		state.Files = map[string]DumpFile{}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return err
 	}
-	file, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	tmp, err := os.CreateTemp(filepath.Dir(s.path), "status-*.tmp")
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	if _, err := file.WriteString(name + "\n"); err != nil {
+	enc := json.NewEncoder(tmp)
+	if err := enc.Encode(state); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
 		return err
 	}
-	return nil
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return os.Rename(tmp.Name(), s.path)
 }

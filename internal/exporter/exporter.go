@@ -78,6 +78,12 @@ type ListAllResult struct {
 	Errors []string   `json:"errors"`
 }
 
+type exportState struct {
+	Files     map[string]DumpFile `json:"files"`
+	Pending   []string            `json:"pending"`
+	Completed []string            `json:"completed"`
+}
+
 type metricsState struct {
 	Status             string
 	Progress           float64
@@ -228,15 +234,9 @@ type Service struct {
 	done      chan struct{}
 	startTime time.Time
 
-	files        []DumpFile
-	queue        []DumpFile
-	processed    map[string]bool
-	byLangTotal  map[string]int
-	byLangDone   map[string]int
-	pages        int
-	downloadErrs int
-	readErrs     int
-	metrics      metricsState
+	state   exportState
+	queue   []DumpFile
+	metrics metricsState
 }
 
 func NewService(cfg config.Config, client *http.Client, sink Sink) *Service {
@@ -261,22 +261,83 @@ func NewServiceWithLister(cfg config.Config, client *http.Client, sink Sink, lis
 
 func (s *Service) Start(ctx context.Context) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.running {
 		if s.paused {
 			log.Printf("resuming export")
 			s.paused = false
 			s.metrics.Status = "running"
 			s.cond.Broadcast()
+			s.mu.Unlock()
 			return nil
 		}
+		s.mu.Unlock()
 		return ErrExportRunning
 	}
+	s.mu.Unlock()
 
-	inv, err := s.lister.List(ctx)
+	state, queue, err := s.prepareJob(ctx)
 	if err != nil {
 		return err
+	}
+	pending := len(queue)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		return ErrExportRunning
+	}
+	s.state = state
+	s.queue = queue
+	totalLangs, processedLangs := languageStats(state)
+	s.metrics = metricsState{
+		Status:             "running",
+		TotalFiles:         len(state.Files),
+		ProcessedFiles:     len(state.Completed),
+		TotalLanguages:     totalLangs,
+		ProcessedLanguages: processedLangs,
+		Progress:           s.progressLocked(),
+		DownloadErrors:     0,
+		ReadErrors:         0,
+		ProcessedPages:     0,
+	}
+	s.startTime = time.Now()
+	s.running = true
+	s.paused = false
+	runCtx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	s.done = make(chan struct{})
+
+	go s.run(runCtx)
+	log.Printf("export starting with %d pending files", pending)
+	return nil
+}
+
+func (s *Service) prepareJob(ctx context.Context) (exportState, []DumpFile, error) {
+	state, err := s.status.Load()
+	if err != nil {
+		return exportState{}, nil, err
+	}
+	if len(state.Pending) == 0 {
+		state, err = s.buildFreshState(ctx)
+		if err != nil {
+			return exportState{}, nil, err
+		}
+	}
+	queue := stateQueue(state)
+	if len(queue) == 0 && len(state.Pending) > 0 {
+		state, err = s.buildFreshState(ctx)
+		if err != nil {
+			return exportState{}, nil, err
+		}
+		queue = stateQueue(state)
+	}
+	return state, queue, nil
+}
+
+func (s *Service) buildFreshState(ctx context.Context) (exportState, error) {
+	inv, err := s.lister.List(ctx)
+	if err != nil {
+		return exportState{}, err
 	}
 	files := append([]DumpFile(nil), inv.Files...)
 	sort.Slice(files, func(i, j int) bool {
@@ -285,58 +346,18 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 		return files[i].Language < files[j].Language
 	})
-
-	processed, err := s.status.Load()
-	if err != nil {
-		return err
+	state := exportState{
+		Files:   make(map[string]DumpFile, len(files)),
+		Pending: make([]string, 0, len(files)),
 	}
-
-	s.files = files
-	s.queue = make([]DumpFile, 0, len(files))
-	s.processed = processed
-	s.byLangTotal = make(map[string]int)
-	s.byLangDone = make(map[string]int)
-	langs := map[string]struct{}{}
-	for _, f := range files {
-		s.byLangTotal[f.Language]++
-		if !processed[f.Name] {
-			s.queue = append(s.queue, f)
-		} else {
-			s.byLangDone[f.Language]++
-		}
-		langs[f.Language] = struct{}{}
+	for _, file := range files {
+		state.Files[file.Name] = file
+		state.Pending = append(state.Pending, file.Name)
 	}
-	processedLangs := 0
-	for name, total := range s.byLangTotal {
-		if total == 0 {
-			continue
-		}
-		if s.byLangDone[name] == total {
-			processedLangs++
-		}
+	if err := s.status.Save(state); err != nil {
+		return exportState{}, err
 	}
-	total := len(s.queue)
-	s.pages = 0
-	s.downloadErrs = 0
-	s.readErrs = 0
-	s.metrics = metricsState{
-		Status:             "running",
-		TotalFiles:         len(files),
-		ProcessedFiles:     len(files) - len(s.queue),
-		TotalLanguages:     len(langs),
-		ProcessedLanguages: processedLangs,
-	}
-	s.metrics.Progress = s.progress()
-	s.startTime = time.Now()
-	s.running = true
-	s.paused = false
-	ctx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
-	s.done = make(chan struct{})
-
-	go s.run(ctx)
-	log.Printf("export starting with %d pending files", total)
-	return nil
+	return state, nil
 }
 
 func (s *Service) Pause() error {
@@ -375,15 +396,17 @@ func (s *Service) Abort() error {
 func (s *Service) List() ListResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	processed := make([]string, 0, len(s.files))
-	pending := make([]string, 0, len(s.queue))
-	for _, f := range s.files {
-		if s.processed != nil && s.processed[f.Name] {
-			processed = append(processed, f.URL)
+	processed := make([]string, 0, len(s.state.Completed))
+	for _, name := range s.state.Completed {
+		if file, ok := s.state.Files[name]; ok {
+			processed = append(processed, file.URL)
 		}
 	}
-	for _, f := range s.queue {
-		pending = append(pending, f.URL)
+	pending := make([]string, 0, len(s.state.Pending))
+	for _, name := range s.state.Pending {
+		if file, ok := s.state.Files[name]; ok {
+			pending = append(pending, file.URL)
+		}
 	}
 	return ListResult{Processed: processed, Pending: pending}
 }
@@ -409,10 +432,7 @@ func (s *Service) snapshotMetrics() metricsState {
 	defer s.mu.Unlock()
 
 	m := s.metrics
-	m.Progress = s.progress()
-	m.ProcessedPages = s.pages
-	m.DownloadErrors = s.downloadErrs
-	m.ReadErrors = s.readErrs
+	m.Progress = s.progressLocked()
 	if s.running {
 		elapsed := time.Since(s.startTime)
 		m.Elapsed = elapsed
@@ -450,12 +470,16 @@ func (s *Service) run(ctx context.Context) {
 	defer func() {
 		s.mu.Lock()
 		s.running = false
+		s.paused = false
+		s.metrics.Progress = s.progressLocked()
 		if ctx.Err() != nil {
 			s.metrics.Status = "aborted"
-		} else if len(s.queue) == 0 {
-			s.metrics.Status = "completed"
-		} else {
-			s.metrics.Status = "idle"
+		} else if s.metrics.Status != "aborted" {
+			if len(s.state.Pending) == 0 {
+				s.metrics.Status = "completed"
+			} else {
+				s.metrics.Status = "idle"
+			}
 		}
 		close(s.done)
 		s.mu.Unlock()
@@ -489,6 +513,8 @@ func (s *Service) run(ctx context.Context) {
 
 func (s *Service) handleFile(ctx context.Context, file DumpFile) error {
 	dest := filepath.Join(s.cfg.WorkDir, file.Name)
+	defer os.Remove(dest)
+
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -499,8 +525,7 @@ func (s *Service) handleFile(ctx context.Context, file DumpFile) error {
 				return err
 			}
 			s.mu.Lock()
-			s.downloadErrs++
-			s.metrics.DownloadErrors = s.downloadErrs
+			s.metrics.DownloadErrors++
 			s.mu.Unlock()
 			log.Printf("download error for %s: %v", file.URL, err)
 			if !sleepWithContext(ctx, downloadRetry) {
@@ -516,50 +541,45 @@ func (s *Service) handleFile(ctx context.Context, file DumpFile) error {
 			return ctx.Err()
 		}
 		log.Printf("processing %s", file.Name)
-		err := s.processDump(ctx, dest, file)
-		if err == nil {
-			break
+		if err := s.processDump(ctx, dest, file); err != nil {
+			if errors.Is(err, context.Canceled) {
+				return err
+			}
+			s.mu.Lock()
+			s.metrics.ReadErrors++
+			s.mu.Unlock()
+			log.Printf("processing error for %s: %v", file.Name, err)
+			if !sleepWithContext(ctx, readRetry) {
+				return context.Canceled
+			}
+			continue
 		}
-		if errors.Is(err, context.Canceled) {
-			return err
-		}
-		s.mu.Lock()
-		s.readErrs++
-		s.metrics.ReadErrors = s.readErrs
-		s.mu.Unlock()
-		log.Printf("processing error for %s: %v", file.Name, err)
-		if !sleepWithContext(ctx, readRetry) {
-			return context.Canceled
-		}
+		break
 	}
 
-	if err := s.status.Append(file.Name); err != nil {
-		log.Printf("status file append failed: %v", err)
+	if err := s.markFileDone(file); err != nil {
+		log.Printf("status update failed for %s: %v", file.Name, err)
 	}
-
-	s.mu.Lock()
-	if s.processed == nil {
-		s.processed = make(map[string]bool)
-	}
-	if !s.processed[file.Name] {
-		s.processed[file.Name] = true
-		s.metrics.ProcessedFiles++
-		s.metrics.Progress = s.progress()
-		s.byLangDone[file.Language]++
-		if s.byLangDone[file.Language] == s.byLangTotal[file.Language] {
-			s.metrics.ProcessedLanguages++
-		}
-	}
-	s.mu.Unlock()
 	log.Printf("finished %s", file.Name)
 	return nil
 }
 
-func (s *Service) progress() float64 {
-	if s.metrics.TotalFiles == 0 {
-		return 0
+func (s *Service) markFileDone(file DumpFile) error {
+	s.mu.Lock()
+	if containsName(s.state.Completed, file.Name) {
+		s.mu.Unlock()
+		return nil
 	}
-	return float64(s.metrics.ProcessedFiles) / float64(s.metrics.TotalFiles)
+	s.state.Pending = removeName(s.state.Pending, file.Name)
+	s.state.Completed = append(s.state.Completed, file.Name)
+	s.metrics.ProcessedFiles = len(s.state.Completed)
+	totalLangs, processedLangs := languageStats(s.state)
+	s.metrics.TotalLanguages = totalLangs
+	s.metrics.ProcessedLanguages = processedLangs
+	s.metrics.Progress = s.progressLocked()
+	stateCopy := s.state
+	s.mu.Unlock()
+	return s.status.Save(stateCopy)
 }
 
 func (s *Service) download(ctx context.Context, src, dest string) error {
@@ -654,8 +674,7 @@ func (s *Service) processDump(ctx context.Context, path string, file DumpFile) e
 			break
 		}
 		s.mu.Lock()
-		s.pages++
-		s.metrics.ProcessedPages = s.pages
+		s.metrics.ProcessedPages++
 		s.mu.Unlock()
 	}
 }
@@ -717,4 +736,74 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+func countProcessedLanguages(total, done map[string]int) int {
+	processed := 0
+	for lang, totalCount := range total {
+		if totalCount == 0 {
+			continue
+		}
+		if done[lang] >= totalCount {
+			processed++
+		}
+	}
+	return processed
+}
+
+func (s *Service) progressLocked() float64 {
+	total := len(s.state.Files)
+	if total == 0 {
+		return 0
+	}
+	completed := len(s.state.Completed)
+	if completed > total {
+		completed = total
+	}
+	return float64(completed) / float64(total)
+}
+
+func stateQueue(state exportState) []DumpFile {
+	queue := make([]DumpFile, 0, len(state.Pending))
+	for _, name := range state.Pending {
+		if file, ok := state.Files[name]; ok {
+			queue = append(queue, file)
+		}
+	}
+	return queue
+}
+
+func languageStats(state exportState) (total, processed int) {
+	totals := make(map[string]int)
+	done := make(map[string]int)
+	for _, file := range state.Files {
+		totals[file.Language]++
+	}
+	for _, name := range state.Completed {
+		if file, ok := state.Files[name]; ok {
+			done[file.Language]++
+		}
+	}
+	total = len(totals)
+	processed = countProcessedLanguages(totals, done)
+	return
+}
+
+func removeName(list []string, name string) []string {
+	for i, v := range list {
+		if v == name {
+			copy(list[i:], list[i+1:])
+			return list[:len(list)-1]
+		}
+	}
+	return list
+}
+
+func containsName(list []string, name string) bool {
+	for _, v := range list {
+		if v == name {
+			return true
+		}
+	}
+	return false
 }

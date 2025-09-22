@@ -30,20 +30,28 @@ go run ./cmd/wikiparser -config config.yml
 
 The repository contains a `docker-compose.yml` that starts the exporter alongside a MediaWiki instance configured for HTML rendering. The default configuration file used by the compose stack is `config.docker.yml`.
 
+The MediaWiki container executes `docker/mediawiki-install.sh` during startup. The script runs an unattended installation the first time the container starts, stores the generated `LocalSettings.php` in a persistent volume, and reuses the same configuration on subsequent restarts. SQLite data files live in a separate volume under `/var/www/data`.
+
 Build and start the stack:
 
 ```
-docker compose up -d
+docker compose up -d --build
 ```
 
-Verify that both services are running:
+Tail the logs to watch the MediaWiki installation and confirm Apache is running:
 
 ```
-curl http://localhost:8080/api.php?action=parse\&format=json\&formatversion=2\&contentmodel=wikitext\&text=Hello
+docker compose logs -f mediawiki
+```
+
+After the MediaWiki container prints `Starting Apache...`, verify that both services respond:
+
+```
+curl "http://localhost:8080/api.php?action=parse&format=json&formatversion=2&contentmodel=wikitext&text=Hello"
 curl http://localhost:8081/metrics
 ```
 
-Once the MediaWiki service responds, trigger a dump export by calling `/start` on the exporter container:
+With the stack running, trigger a dump export by calling `/start` on the exporter container:
 
 ```
 curl -X POST http://localhost:8081/start

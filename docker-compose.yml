@@ -11,12 +11,15 @@ services:
       MW_DB_TYPE: sqlite
       MW_DB_NAME: mediawiki
       MW_DB_DIRECTORY: /var/www/data
+      MW_CONFIG_PATH: /mw-config
       MW_ADMIN_USER: admin
       MW_ADMIN_PASS: adminpass
       MW_UPGRADE_KEY: change-me
     volumes:
       - mediawiki-images:/var/www/html/images
       - mediawiki-data:/var/www/data
+      - mediawiki-config:/mw-config
+      - ./docker/mediawiki-install.sh:/docker-entrypoint.d/10-install.sh:ro
     ports:
       - "8080:80"
 
@@ -34,3 +37,4 @@ services:
 volumes:
   mediawiki-images:
   mediawiki-data:
+  mediawiki-config:

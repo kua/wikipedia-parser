@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -179,4 +180,29 @@ func gzipData(data []byte) []byte {
 	gz.Write(data)
 	gz.Close()
 	return buf.Bytes()
+}
+
+func TestRenderPageUnexpectedContentType(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("<html><body>install</body></html>"))
+	}))
+	defer server.Close()
+
+	svc := &Service{
+		cfg:    config.Config{MediaWikiAPI: server.URL},
+		client: server.Client(),
+	}
+
+	_, err := svc.renderPage(context.Background(), "en", "Foo", "wikitext")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "unexpected content-type") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "install") {
+		t.Fatalf("snippet missing in error: %v", err)
+	}
 }

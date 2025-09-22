@@ -786,22 +786,32 @@ func (s *Service) renderPage(ctx context.Context, lang, title, text string) ([]b
 		return nil, fmt.Errorf("mediawiki render status %s for %s/%s", resp.Status, lang, title)
 	}
 
-	var parsed mediaWikiParseResponse
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return nil, err
 	}
+	snippet := makeBodySnippet(body)
+
+	if ct := resp.Header.Get("Content-Type"); ct != "" && !strings.Contains(ct, "json") {
+		return nil, fmt.Errorf("mediawiki render unexpected content-type %q for %s/%s (body snippet: %q)", ct, lang, title, snippet)
+	}
+
+	var parsed mediaWikiParseResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		snippet := strings.TrimSpace(string(body))
-		if len(snippet) > 512 {
-			snippet = snippet[:512] + "..."
-		}
 		return nil, fmt.Errorf("mediawiki render decode error for %s/%s: %w (body snippet: %q)", lang, title, err, snippet)
 	}
 	if parsed.Error != nil {
 		return nil, fmt.Errorf("mediawiki render error %s: %s", parsed.Error.Code, parsed.Error.Info)
 	}
 	return []byte(parsed.Parse.Text), nil
+}
+
+func makeBodySnippet(body []byte) string {
+	snippet := strings.TrimSpace(string(body))
+	if len(snippet) > 512 {
+		snippet = snippet[:512] + "..."
+	}
+	return snippet
 }
 
 type mediaWikiParseResponse struct {

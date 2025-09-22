@@ -1,0 +1,36 @@
+version: "3.9"
+
+services:
+  mediawiki:
+    image: mediawiki:1.41
+    restart: unless-stopped
+    environment:
+      MW_SITE_SERVER: http://localhost:8080
+      MW_SITE_NAME: LocalWiki
+      MW_SITE_LANG: en
+      MW_DB_TYPE: sqlite
+      MW_DB_NAME: mediawiki
+      MW_DB_DIRECTORY: /var/www/data
+      MW_ADMIN_USER: admin
+      MW_ADMIN_PASS: adminpass
+      MW_UPGRADE_KEY: change-me
+    volumes:
+      - mediawiki-images:/var/www/html/images
+      - mediawiki-data:/var/www/data
+    ports:
+      - "8080:80"
+
+  wikiparser:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - mediawiki
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./config.docker.yml:/app/config.yml:ro
+      - ./data:/data
+
+volumes:
+  mediawiki-images:
+  mediawiki-data:

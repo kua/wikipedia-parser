@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -58,6 +59,14 @@ func TestServiceRun(t *testing.T) {
 			w.Write(gzData)
 		case "/ruwiki/latest/ruwiki-latest-pages-articles1.xml-p1p2.gz":
 			w.Write(gzData)
+		case "/api.php":
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			text := r.FormValue("text")
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"parse": map[string]string{"text": fmt.Sprintf("<p>%s</p>", text)}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -66,11 +75,13 @@ func TestServiceRun(t *testing.T) {
 
 	client := server.Client()
 	cfg := config.Config{
-		DumpBaseURL: server.URL,
-		WorkDir:     tmp,
-		HTTPAddr:    ":0",
-		Sink:        "stdout",
-		StatusFile:  filepath.Join(tmp, "status.log"),
+		DumpBaseURL:       server.URL,
+		WorkDir:           tmp,
+		HTTPAddr:          ":0",
+		Sink:              "stdout",
+		StatusFile:        filepath.Join(tmp, "status.log"),
+		MediaWikiAPI:      server.URL + "/api.php",
+		MaxRenderInflight: 2,
 	}
 	lister := &httpLister{base: cfg.DumpBaseURL, client: client, dblistURL: server.URL + "/conf/dblists/wikipedia.dblist"}
 	sink := &memorySink{}
@@ -84,11 +95,22 @@ func TestServiceRun(t *testing.T) {
 	if len(sink.pages) != 4 {
 		t.Fatalf("expected 4 pages, got %d", len(sink.pages))
 	}
-	if sink.pages[0].GetSrcUrl() != "https://en.wikipedia.org/wiki/Foo_Bar" {
-		t.Fatalf("unexpected src url: %s", sink.pages[0].GetSrcUrl())
+	pagesByURL := make(map[string]*pageproto.Page)
+	for _, page := range sink.pages {
+		pagesByURL[page.GetSrcUrl()] = page
 	}
-	if sink.pages[0].GetHttpCode() != 200 || sink.pages[0].GetIp() == 0 {
-		t.Fatalf("unexpected page fields: %+v", sink.pages[0])
+	fooPage, ok := pagesByURL["https://en.wikipedia.org/wiki/Foo_Bar"]
+	if !ok {
+		t.Fatalf("foo page missing: %v", pagesByURL)
+	}
+	if fooPage.GetHttpCode() != 200 || fooPage.GetIp() == 0 {
+		t.Fatalf("unexpected page fields: %+v", fooPage)
+	}
+	if ct := fooPage.GetHeaders()["Content-Type"]; ct != "text/html; charset=utf-8" {
+		t.Fatalf("unexpected content type: %q", ct)
+	}
+	if body := string(fooPage.GetContent()); body != "<p>hello</p>" {
+		t.Fatalf("unexpected html content: %s", body)
 	}
 
 	list := svc.List()

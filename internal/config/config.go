@@ -10,13 +10,15 @@ import (
 )
 
 type Config struct {
-	DumpBaseURL string `yaml:"dump_base_url"`
-	KafkaBroker string `yaml:"kafka_broker"`
-	KafkaTopic  string `yaml:"kafka_topic"`
-	WorkDir     string `yaml:"work_dir"`
-	HTTPAddr    string `yaml:"http_addr"`
-	Sink        string `yaml:"sink"`
-	StatusFile  string `yaml:"status_file"`
+	DumpBaseURL       string `yaml:"dump_base_url"`
+	KafkaBroker       string `yaml:"kafka_broker"`
+	KafkaTopic        string `yaml:"kafka_topic"`
+	WorkDir           string `yaml:"work_dir"`
+	HTTPAddr          string `yaml:"http_addr"`
+	Sink              string `yaml:"sink"`
+	StatusFile        string `yaml:"status_file"`
+	MediaWikiAPI      string `yaml:"mediawiki_api_url"`
+	MaxRenderInflight int    `yaml:"max_render_inflight"`
 }
 
 func Load(path string) (Config, error) {
@@ -24,7 +26,7 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
-	cfg := Config{HTTPAddr: ":8080", Sink: "kafka"}
+	cfg := Config{HTTPAddr: ":8080", Sink: "kafka", MaxRenderInflight: 4}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
@@ -34,6 +36,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.WorkDir == "" {
 		missing = append(missing, "work_dir")
+	}
+	if cfg.MediaWikiAPI == "" {
+		missing = append(missing, "mediawiki_api_url")
 	}
 	if len(missing) > 0 {
 		return Config{}, fmt.Errorf("missing %s", strings.Join(missing, ", "))
@@ -61,6 +66,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.StatusFile == "" {
 		cfg.StatusFile = filepath.Join(cfg.WorkDir, "status.log")
+	}
+	if cfg.MaxRenderInflight <= 0 {
+		cfg.MaxRenderInflight = 1
 	}
 	return cfg, nil
 }

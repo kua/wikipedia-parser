@@ -5,3 +5,5 @@ work_dir: ./data
 status_file: ./data/status.log
 sink: kafka
 http_addr: :8080
+mediawiki_api_url: http://localhost:8080/api.php
+max_render_inflight: 4

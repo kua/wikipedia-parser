@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -626,57 +627,182 @@ func (s *Service) processDump(ctx context.Context, path string, file DumpFile) e
 	}
 	defer reader.Close()
 
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	decoder := xml.NewDecoder(bufio.NewReader(reader))
+	jobs := make(chan pageJob)
+	workerErr := make(chan error, 1)
+
+	workers := s.cfg.MaxRenderInflight
+	if workers <= 0 {
+		workers = 1
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				if err := s.renderAndSendPage(workerCtx, job.lang, job.title, job.text); err != nil {
+					select {
+					case workerErr <- err:
+					default:
+					}
+					cancel()
+					return
+				}
+			}
+		}()
+	}
+
+	var decodeErr error
+loop:
 	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if err := workerCtx.Err(); err != nil {
+			decodeErr = err
+			break
 		}
 		token, err := decoder.Token()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				return nil
+				break
 			}
-			return err
+			decodeErr = err
+			break
 		}
-		start, ok := token.(xml.StartElement)
-		if !ok || start.Name.Local != "page" {
+		startElem, ok := token.(xml.StartElement)
+		if !ok || startElem.Name.Local != "page" {
 			continue
 		}
 		var page xmlPage
-		if err := decoder.DecodeElement(&page, &start); err != nil {
-			return err
+		if err := decoder.DecodeElement(&page, &startElem); err != nil {
+			decodeErr = err
+			break
 		}
 		title := strings.TrimSpace(page.Title)
 		if title == "" {
 			continue
 		}
-		payload := &pageproto.Page{
-			SrcUrl:   buildPageURL(file.Language, title),
-			HttpCode: 200,
-			Content:  []byte(page.Revision.Text.Value),
-			Ip:       wikipediaIP(),
+		job := pageJob{lang: file.Language, title: title, text: page.Revision.Text.Value}
+		select {
+		case jobs <- job:
+		case <-workerCtx.Done():
+			decodeErr = workerCtx.Err()
+			break loop
 		}
-		data, err := pageproto.Marshal(payload)
+	}
+
+	close(jobs)
+	wg.Wait()
+
+	select {
+	case err := <-workerErr:
 		if err != nil {
 			return err
 		}
-		for {
-			if ctx.Err() != nil {
-				return ctx.Err()
+	default:
+	}
+
+	if decodeErr != nil {
+		return decodeErr
+	}
+	if err := workerCtx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+type pageJob struct {
+	lang  string
+	title string
+	text  string
+}
+
+func (s *Service) renderAndSendPage(ctx context.Context, lang, title, text string) error {
+	html, err := s.renderPage(ctx, title, text)
+	if err != nil {
+		return err
+	}
+	payload := &pageproto.Page{
+		SrcUrl:   buildPageURL(lang, title),
+		HttpCode: 200,
+		Headers: map[string]string{
+			"Content-Type": "text/html; charset=utf-8",
+		},
+		Content: html,
+		Ip:      wikipediaIP(),
+	}
+	data, err := pageproto.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := s.sink.Send(ctx, []byte(title), data); err != nil {
+			log.Printf("sink error for %s: %v", title, err)
+			if !sleepWithContext(ctx, sendRetry) {
+				return context.Canceled
 			}
-			if err := s.sink.Send(ctx, []byte(title), data); err != nil {
-				log.Printf("sink error for %s: %v", title, err)
-				if !sleepWithContext(ctx, sendRetry) {
-					return context.Canceled
-				}
-				continue
-			}
-			break
+			continue
 		}
 		s.mu.Lock()
 		s.metrics.ProcessedPages++
 		s.mu.Unlock()
+		return nil
 	}
+}
+
+func (s *Service) renderPage(ctx context.Context, title, text string) ([]byte, error) {
+	if strings.TrimSpace(text) == "" {
+		return []byte{}, nil
+	}
+	form := url.Values{}
+	form.Set("action", "parse")
+	form.Set("format", "json")
+	form.Set("formatversion", "2")
+	form.Set("prop", "text")
+	form.Set("contentmodel", "wikitext")
+	form.Set("title", title)
+	form.Set("text", text)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.MediaWikiAPI, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", chromeUA)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("mediawiki render status %s", resp.Status)
+	}
+
+	var parsed mediaWikiParseResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, err
+	}
+	if parsed.Error != nil {
+		return nil, fmt.Errorf("mediawiki render error %s: %s", parsed.Error.Code, parsed.Error.Info)
+	}
+	return []byte(parsed.Parse.Text), nil
+}
+
+type mediaWikiParseResponse struct {
+	Parse struct {
+		Text string `json:"text"`
+	} `json:"parse"`
+	Error *struct {
+		Code string `json:"code"`
+		Info string `json:"info"`
+	} `json:"error"`
 }
 
 type xmlPage struct {

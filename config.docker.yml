@@ -1,0 +1,7 @@
+dump_base_url: https://dumps.wikimedia.org/
+work_dir: /data
+status_file: /data/status.log
+sink: stdout
+http_addr: :8081
+mediawiki_api_url: http://mediawiki/api.php
+max_render_inflight: 4

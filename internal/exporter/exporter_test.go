@@ -39,18 +39,18 @@ func TestServiceRun(t *testing.T) {
 	archives := map[string]*fakeZimArchive{
 		"wikipedia_en_history_nopic_20240101.zim": {
 			entries: []fakeZimEntry{
-				{namespace: 'A', title: "Alpha", url: "A/Alpha", mime: "text/html", data: []byte("<html>alpha</html>")},
-				{namespace: 'A', title: "Foo Bar", url: "A/Foo_Bar", mime: "text/html", data: []byte("<html>foo</html>")},
-				{namespace: 'A', title: "Packed", url: "A/Packed", mime: "text/html", data: gzipBytes("<html>packed</html>")},
-				{namespace: 'A', title: "README", url: "A/README", mime: "text/html", data: []byte("<html>ignore</html>")},
-				{namespace: 'I', title: "Image", url: "I/image.png", mime: "image/png", data: []byte("binary")},
-				{namespace: 'A', title: "notes", url: "A/notes.htm", mime: "text/html", data: []byte("<html>note</html>")},
+				{title: "Alpha", url: "A/Alpha", mime: "text/html", data: []byte("<html>alpha</html>")},
+				{title: "Foo Bar", url: "A/Foo_Bar", mime: "text/html", data: []byte("<html>foo</html>")},
+				{title: "Packed", url: "A/Packed", mime: "text/html", data: gzipBytes("<html>packed</html>")},
+				{title: "README", url: "A/README", mime: "text/html", data: []byte("<html>ignore</html>")},
+				{title: "Image", url: "I/image.png", mime: "image/png", data: []byte("binary")},
+				{title: "notes", url: "A/notes.htm", mime: "text/html", data: []byte("<html>note</html>")},
 			},
 		},
 		"wikipedia_ru_science_nopic_20240101.zim": {
 			entries: []fakeZimEntry{
-				{namespace: 'A', title: "Privet", url: "A/Privet", mime: "text/html", data: []byte("<html>privet</html>")},
-				{namespace: 'A', title: "meta", url: "A/meta.json", mime: "application/json", data: []byte("{}")},
+				{title: "Privet", url: "A/Privet", mime: "text/html", data: []byte("<html>privet</html>")},
+				{title: "meta", url: "A/meta.json", mime: "application/json", data: []byte("{}")},
 			},
 		},
 	}
@@ -208,19 +208,25 @@ func (f *fakeZimArchive) Walk(ctx context.Context, fn func(zimEntry) error) erro
 }
 
 type fakeZimEntry struct {
-	namespace byte
-	title     string
-	url       string
-	mime      string
-	data      []byte
+	title    string
+	url      string
+	mime     string
+	data     []byte
+	redirect bool
+	hasItem  *bool
 }
 
-func (f fakeZimEntry) Namespace() byte       { return f.namespace }
 func (f fakeZimEntry) Title() string         { return f.title }
 func (f fakeZimEntry) URL() string           { return f.url }
 func (f fakeZimEntry) MimeType() string      { return f.mime }
 func (f fakeZimEntry) Data() ([]byte, error) { return f.data, nil }
-func (f fakeZimEntry) IsArticle() bool       { return f.namespace == 'A' }
+func (f fakeZimEntry) IsRedirect() bool      { return f.redirect }
+func (f fakeZimEntry) HasItem() bool {
+	if f.hasItem != nil {
+		return *f.hasItem
+	}
+	return len(f.data) > 0
+}
 
 func gzipBytes(body string) []byte {
 	var buf bytes.Buffer

@@ -20,7 +20,6 @@ import (
 	"sync"
 	"time"
 
-	zim "github.com/dps/go-zim"
 	"github.com/klauspost/compress/zstd"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -28,6 +27,7 @@ import (
 
 	"github.com/example/wikipedia-parser/internal/config"
 	"github.com/example/wikipedia-parser/internal/pageproto"
+	libzim "github.com/example/wikipedia-parser/internal/zim"
 )
 
 const (
@@ -697,7 +697,10 @@ func isArticleEntry(entry zimEntry) bool {
 	if entry == nil {
 		return false
 	}
-	if !entry.IsArticle() && entry.Namespace() != 'A' {
+	if entry.IsRedirect() {
+		return false
+	}
+	if !entry.HasItem() {
 		return false
 	}
 	mime := strings.ToLower(strings.TrimSpace(entry.MimeType()))
@@ -867,119 +870,102 @@ type zimArchive interface {
 }
 
 type zimEntry interface {
-	Namespace() byte
 	Title() string
 	URL() string
 	MimeType() string
 	Data() ([]byte, error)
-	IsArticle() bool
+	IsRedirect() bool
+	HasItem() bool
 }
 
 func openZimArchive(path string) (zimArchive, error) {
-	file, err := zim.Open(path)
+	file, err := libzim.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	return &goZimArchive{file: file}, nil
+	return &libzimArchive{file: file}, nil
 }
 
-type goZimArchive struct {
-	file *zim.File
+type libzimArchive struct {
+	file *libzim.Archive
 }
 
-func (a *goZimArchive) Close() error {
+func (a *libzimArchive) Close() error {
 	if a.file == nil {
 		return nil
 	}
-	a.file.Close()
+	err := a.file.Close()
 	a.file = nil
-	return nil
+	return err
 }
 
-func (a *goZimArchive) Walk(ctx context.Context, fn func(zimEntry) error) error {
+func (a *libzimArchive) Walk(ctx context.Context, fn func(zimEntry) error) error {
 	if a.file == nil {
 		return nil
 	}
-	total := a.file.ArticleCount()
+	total := a.file.EntryCount()
 	for idx := uint32(0); idx < total; idx++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		entry, err := a.file.EntryAtURLPosition(idx)
+		entry, err := a.file.EntryAt(idx)
 		if err != nil {
 			continue
 		}
-		entryCopy := entry
-		if err := fn(goZimEntry{file: a.file, entry: &entryCopy}); err != nil {
-			return err
+		current := &libzimEntry{entry: entry}
+		callErr := fn(current)
+		entry.Close()
+		if callErr != nil {
+			return callErr
 		}
 	}
 	return nil
 }
 
-type goZimEntry struct {
-	file  *zim.File
-	entry *zim.DirectoryEntry
+type libzimEntry struct {
+	entry *libzim.Entry
 }
 
-func (e goZimEntry) Namespace() byte {
-	if e.entry == nil {
-		return 0
-	}
-	return byte(e.entry.Namespace())
-}
-
-func (e goZimEntry) Title() string {
-	if e.entry == nil {
+func (e *libzimEntry) Title() string {
+	if e == nil || e.entry == nil {
 		return ""
 	}
-	title := strings.TrimSpace(string(e.entry.Title()))
-	if title != "" {
-		return title
-	}
-	return strings.TrimSpace(string(e.entry.URL()))
+	return strings.TrimSpace(e.entry.Title())
 }
 
-func (e goZimEntry) URL() string {
-	if e.entry == nil {
+func (e *libzimEntry) URL() string {
+	if e == nil || e.entry == nil {
 		return ""
 	}
-	return string(e.entry.URL())
+	return strings.TrimSpace(e.entry.Path())
 }
 
-func (e goZimEntry) MimeType() string {
-	if e.file == nil || e.entry == nil {
+func (e *libzimEntry) MimeType() string {
+	if e == nil || e.entry == nil {
 		return ""
 	}
-	mt := e.entry.Mimetype()
-	switch mt {
-	case zim.MimetypeDeletedEntry, zim.MimetypeLinkTarget, zim.MimetypeRedirectEntry:
-		return ""
-	}
-	idx := int(mt)
-	list := e.file.MimetypeList()
-	if idx >= 0 && idx < len(list) {
-		return list[idx]
-	}
-	return ""
+	return strings.TrimSpace(e.entry.MimeType(false))
 }
 
-func (e goZimEntry) Data() ([]byte, error) {
-	if e.file == nil || e.entry == nil {
+func (e *libzimEntry) Data() ([]byte, error) {
+	if e == nil || e.entry == nil {
 		return nil, nil
 	}
-	reader, _, err := e.file.BlobReader(e.entry)
-	if err != nil {
-		return nil, err
-	}
-	return io.ReadAll(reader)
+	return e.entry.Data()
 }
 
-func (e goZimEntry) IsArticle() bool {
-	if e.entry == nil {
+func (e *libzimEntry) IsRedirect() bool {
+	if e == nil || e.entry == nil {
 		return false
 	}
-	return e.entry.IsArticle()
+	return e.entry.IsRedirect()
+}
+
+func (e *libzimEntry) HasItem() bool {
+	if e == nil || e.entry == nil {
+		return false
+	}
+	return e.entry.HasItem()
 }
 
 func ConvertFile(ctx context.Context, cfg config.Config, sink Sink, path string) error {

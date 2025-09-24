@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	zim "github.com/akhenakh/gozim"
+	zim "github.com/dps/go-zim"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -791,40 +791,40 @@ type zimEntry interface {
 }
 
 func openZimArchive(path string) (zimArchive, error) {
-	reader, err := zim.NewReader(path, false)
+	file, err := zim.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	return &goZimArchive{reader: reader}, nil
+	return &goZimArchive{file: file}, nil
 }
 
 type goZimArchive struct {
-	reader *zim.ZimReader
+	file *zim.File
 }
 
 func (a *goZimArchive) Close() error {
-	if a.reader == nil {
+	if a.file == nil {
 		return nil
 	}
-	return a.reader.Close()
+	a.file.Close()
+	a.file = nil
+	return nil
 }
 
 func (a *goZimArchive) Walk(ctx context.Context, fn func(zimEntry) error) error {
-	if a.reader == nil {
+	if a.file == nil {
 		return nil
 	}
-	for idx := uint32(1); idx < a.reader.ArticleCount; idx++ {
+	total := a.file.ArticleCount()
+	for idx := uint32(0); idx < total; idx++ {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		article, err := a.reader.ArticleAtURLIdx(idx)
+		entry, err := a.file.EntryAtURLPosition(idx)
 		if err != nil {
 			continue
 		}
-		if article == nil {
-			continue
-		}
-		if err := fn(goZimEntry{article: article}); err != nil {
+		if err := fn(goZimEntry{file: a.file, entry: entry}); err != nil {
 			return err
 		}
 	}
@@ -832,42 +832,52 @@ func (a *goZimArchive) Walk(ctx context.Context, fn func(zimEntry) error) error 
 }
 
 type goZimEntry struct {
-	article *zim.Article
+	file  *zim.File
+	entry zim.DirectoryEntry
 }
 
 func (e goZimEntry) Namespace() byte {
-	if e.article == nil {
-		return 0
-	}
-	return e.article.Namespace
+	return byte(e.entry.Namespace())
 }
 
 func (e goZimEntry) Title() string {
-	if e.article == nil {
-		return ""
+	title := strings.TrimSpace(string(e.entry.Title()))
+	if title != "" {
+		return title
 	}
-	return strings.TrimSpace(e.article.Title)
+	return strings.TrimSpace(string(e.entry.URL()))
 }
 
 func (e goZimEntry) URL() string {
-	if e.article == nil {
-		return ""
-	}
-	return e.article.FullURL()
+	return string(e.entry.URL())
 }
 
 func (e goZimEntry) MimeType() string {
-	if e.article == nil {
+	if e.file == nil {
 		return ""
 	}
-	return e.article.MimeType()
+	mt := e.entry.Mimetype()
+	switch mt {
+	case zim.MimetypeDeletedEntry, zim.MimetypeLinkTarget, zim.MimetypeRedirectEntry:
+		return ""
+	}
+	idx := int(mt)
+	list := e.file.MimetypeList()
+	if idx >= 0 && idx < len(list) {
+		return list[idx]
+	}
+	return ""
 }
 
 func (e goZimEntry) Data() ([]byte, error) {
-	if e.article == nil {
+	if e.file == nil {
 		return nil, nil
 	}
-	return e.article.Data()
+	reader, _, err := e.file.BlobReader(&e.entry)
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(reader)
 }
 
 func ConvertFile(ctx context.Context, cfg config.Config, sink Sink, path string) error {

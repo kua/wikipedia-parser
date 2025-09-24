@@ -1,6 +1,9 @@
 package exporter
 
 import (
+	"bytes"
+	"compress/bzip2"
+	"compress/gzip"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -17,9 +20,11 @@ import (
 	"sync"
 	"time"
 
-	zim "github.com/dps/go-zim"
+	"github.com/klauspost/compress/zstd"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	zim "github.com/tim-st/go-zim"
+	xz "github.com/xi2/xz"
 
 	"github.com/example/wikipedia-parser/internal/config"
 	"github.com/example/wikipedia-parser/internal/pageproto"
@@ -646,7 +651,14 @@ func processZimArchive(ctx context.Context, archive zimArchive, file DumpFile, s
 		if err != nil {
 			return err
 		}
-		if len(content) == 0 {
+		content, err = normalizeHTMLContent(content)
+		if err != nil {
+			return err
+		}
+		if len(bytes.TrimSpace(content)) == 0 {
+			return nil
+		}
+		if !isProbablyHTML(content) {
 			return nil
 		}
 		payload := &pageproto.Page{
@@ -685,29 +697,26 @@ func isArticleEntry(entry zimEntry) bool {
 	if entry == nil {
 		return false
 	}
-	if entry.Namespace() != 'A' {
+	if !entry.IsArticle() && entry.Namespace() != 'A' {
 		return false
 	}
-	mime := strings.ToLower(entry.MimeType())
+	mime := strings.ToLower(strings.TrimSpace(entry.MimeType()))
 	if mime == "" {
 		return false
 	}
-	if !strings.HasPrefix(mime, "text/html") && !strings.HasPrefix(mime, "application/xhtml") {
+	if !strings.Contains(mime, "html") {
 		return false
 	}
 	title := strings.TrimSpace(entry.Title())
 	if title == "" {
 		return false
 	}
-	slug := strings.ToLower(articleSlug(entry))
-	if slug == "" {
-		slug = strings.ToLower(strings.ReplaceAll(title, " ", "_"))
-	}
+	slug := strings.ToLower(strings.TrimSpace(articleSlug(entry)))
 	slug = strings.Trim(slug, "/")
-	if slug == "" {
-		return false
-	}
 	base := slug
+	if base == "" {
+		base = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(title, " ", "_")))
+	}
 	if idx := strings.LastIndex(base, "/"); idx >= 0 {
 		base = base[idx+1:]
 	}
@@ -775,6 +784,81 @@ func articleSlug(entry zimEntry) string {
 	return url
 }
 
+const maxContentDecodePasses = 3
+
+func normalizeHTMLContent(data []byte) ([]byte, error) {
+	var err error
+	for pass := 0; pass < maxContentDecodePasses; pass++ {
+		if isProbablyHTML(data) {
+			return data, nil
+		}
+		switch detectCompression(data) {
+		case "gzip":
+			var reader *gzip.Reader
+			reader, err = gzip.NewReader(bytes.NewReader(data))
+			if err != nil {
+				return nil, err
+			}
+			data, err = io.ReadAll(reader)
+			closeErr := reader.Close()
+			if err == nil && closeErr != nil {
+				err = closeErr
+			}
+		case "xz":
+			var xzr *xz.Reader
+			xzr, err = xz.NewReader(bytes.NewReader(data), 0)
+			if err != nil {
+				return nil, err
+			}
+			data, err = io.ReadAll(xzr)
+		case "zstd":
+			var dec *zstd.Decoder
+			dec, err = zstd.NewReader(bytes.NewReader(data))
+			if err != nil {
+				return nil, err
+			}
+			data, err = io.ReadAll(dec)
+			dec.Close()
+		case "bzip2":
+			data, err = io.ReadAll(bzip2.NewReader(bytes.NewReader(data)))
+		default:
+			return data, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return data, nil
+}
+
+func detectCompression(data []byte) string {
+	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+		return "gzip"
+	}
+	if len(data) >= 6 && bytes.HasPrefix(data, []byte{0xFD, '7', 'z', 'X', 'Z', 0x00}) {
+		return "xz"
+	}
+	if len(data) >= 4 && bytes.HasPrefix(data, []byte{0x28, 0xB5, 0x2F, 0xFD}) {
+		return "zstd"
+	}
+	if len(data) >= 3 && bytes.HasPrefix(data, []byte{'B', 'Z', 'h'}) {
+		return "bzip2"
+	}
+	return ""
+}
+
+func isProbablyHTML(data []byte) bool {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return false
+	}
+	lower := bytes.ToLower(trimmed)
+	if trimmed[0] == '<' {
+		return true
+	}
+	return bytes.HasPrefix(lower, []byte("<!doctype")) || bytes.HasPrefix(lower, []byte("<?xml"))
+}
+
 type zimOpener func(path string) (zimArchive, error)
 
 type zimArchive interface {
@@ -788,6 +872,7 @@ type zimEntry interface {
 	URL() string
 	MimeType() string
 	Data() ([]byte, error)
+	IsArticle() bool
 }
 
 func openZimArchive(path string) (zimArchive, error) {
@@ -878,6 +963,10 @@ func (e goZimEntry) Data() ([]byte, error) {
 		return nil, err
 	}
 	return io.ReadAll(reader)
+}
+
+func (e goZimEntry) IsArticle() bool {
+	return e.entry.IsArticle()
 }
 
 func ConvertFile(ctx context.Context, cfg config.Config, sink Sink, path string) error {

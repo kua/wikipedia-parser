@@ -2,6 +2,7 @@ package exporter
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -40,6 +41,7 @@ func TestServiceRun(t *testing.T) {
 			entries: []fakeZimEntry{
 				{namespace: 'A', title: "Alpha", url: "A/Alpha", mime: "text/html", data: []byte("<html>alpha</html>")},
 				{namespace: 'A', title: "Foo Bar", url: "A/Foo_Bar", mime: "text/html", data: []byte("<html>foo</html>")},
+				{namespace: 'A', title: "Packed", url: "A/Packed", mime: "text/html", data: gzipBytes("<html>packed</html>")},
 				{namespace: 'A', title: "README", url: "A/README", mime: "text/html", data: []byte("<html>ignore</html>")},
 				{namespace: 'I', title: "Image", url: "I/image.png", mime: "image/png", data: []byte("binary")},
 				{namespace: 'A', title: "notes", url: "A/notes.htm", mime: "text/html", data: []byte("<html>note</html>")},
@@ -107,6 +109,7 @@ func TestServiceRun(t *testing.T) {
 		"https://en.wikipedia.org/wiki/Foo_Bar": "<html>foo</html>",
 		"https://en.wikipedia.org/wiki/notes":   "<html>note</html>",
 		"https://ru.wikipedia.org/wiki/Privet":  "<html>privet</html>",
+		"https://en.wikipedia.org/wiki/Packed":  "<html>packed</html>",
 	}
 	if len(sink.pages) != len(expected) {
 		t.Fatalf("expected %d pages, got %d", len(expected), len(sink.pages))
@@ -184,7 +187,7 @@ func TestServiceRun(t *testing.T) {
 		t.Fatalf("restart: %v", err)
 	}
 	svc2.Wait()
-	if len(sink.pages) != 8 {
+	if len(sink.pages) != 10 {
 		t.Fatalf("expected pages to be re-exported, got %d", len(sink.pages))
 	}
 }
@@ -217,3 +220,16 @@ func (f fakeZimEntry) Title() string         { return f.title }
 func (f fakeZimEntry) URL() string           { return f.url }
 func (f fakeZimEntry) MimeType() string      { return f.mime }
 func (f fakeZimEntry) Data() ([]byte, error) { return f.data, nil }
+func (f fakeZimEntry) IsArticle() bool       { return f.namespace == 'A' }
+
+func gzipBytes(body string) []byte {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(body)); err != nil {
+		panic(err)
+	}
+	if err := zw.Close(); err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}

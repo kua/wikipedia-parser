@@ -20,10 +20,10 @@ import (
 	"sync"
 	"time"
 
+	zim "github.com/dps/go-zim"
 	"github.com/klauspost/compress/zstd"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	zim "github.com/tim-st/go-zim"
 	xz "github.com/xi2/xz"
 
 	"github.com/example/wikipedia-parser/internal/config"
@@ -909,7 +909,8 @@ func (a *goZimArchive) Walk(ctx context.Context, fn func(zimEntry) error) error 
 		if err != nil {
 			continue
 		}
-		if err := fn(goZimEntry{file: a.file, entry: entry}); err != nil {
+		entryCopy := entry
+		if err := fn(goZimEntry{file: a.file, entry: &entryCopy}); err != nil {
 			return err
 		}
 	}
@@ -918,14 +919,20 @@ func (a *goZimArchive) Walk(ctx context.Context, fn func(zimEntry) error) error 
 
 type goZimEntry struct {
 	file  *zim.File
-	entry zim.DirectoryEntry
+	entry *zim.DirectoryEntry
 }
 
 func (e goZimEntry) Namespace() byte {
+	if e.entry == nil {
+		return 0
+	}
 	return byte(e.entry.Namespace())
 }
 
 func (e goZimEntry) Title() string {
+	if e.entry == nil {
+		return ""
+	}
 	title := strings.TrimSpace(string(e.entry.Title()))
 	if title != "" {
 		return title
@@ -934,11 +941,14 @@ func (e goZimEntry) Title() string {
 }
 
 func (e goZimEntry) URL() string {
+	if e.entry == nil {
+		return ""
+	}
 	return string(e.entry.URL())
 }
 
 func (e goZimEntry) MimeType() string {
-	if e.file == nil {
+	if e.file == nil || e.entry == nil {
 		return ""
 	}
 	mt := e.entry.Mimetype()
@@ -955,10 +965,10 @@ func (e goZimEntry) MimeType() string {
 }
 
 func (e goZimEntry) Data() ([]byte, error) {
-	if e.file == nil {
+	if e.file == nil || e.entry == nil {
 		return nil, nil
 	}
-	reader, _, err := e.file.BlobReader(&e.entry)
+	reader, _, err := e.file.BlobReader(e.entry)
 	if err != nil {
 		return nil, err
 	}
@@ -966,6 +976,9 @@ func (e goZimEntry) Data() ([]byte, error) {
 }
 
 func (e goZimEntry) IsArticle() bool {
+	if e.entry == nil {
+		return false
+	}
 	return e.entry.IsArticle()
 }
 

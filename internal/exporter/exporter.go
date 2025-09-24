@@ -1,12 +1,8 @@
 package exporter
 
 import (
-	"bufio"
-	"compress/bzip2"
-	"compress/gzip"
 	"context"
 	"encoding/binary"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	zim "github.com/akhenakh/gozim"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
@@ -226,6 +223,8 @@ type Service struct {
 	status *statusFile
 	prom   *promMetrics
 
+	openZim zimOpener
+
 	mu        sync.Mutex
 	cond      *sync.Cond
 	running   bool
@@ -253,6 +252,7 @@ func NewServiceWithLister(cfg config.Config, client *http.Client, sink Sink, lis
 		status:  newStatusFile(cfg.StatusFile),
 		metrics: metricsState{Status: "idle"},
 		prom:    prom,
+		openZim: openZimArchive,
 	}
 	svc.cond = sync.NewCond(&svc.mu)
 	prom.update(svc.metrics)
@@ -620,40 +620,39 @@ func (s *Service) download(ctx context.Context, src, dest string) error {
 }
 
 func (s *Service) processDump(ctx context.Context, path string, file DumpFile) error {
-	reader, err := openDump(path)
+	archive, err := s.openZim(path)
 	if err != nil {
 		return err
 	}
-	defer reader.Close()
+	defer archive.Close()
 
-	decoder := xml.NewDecoder(bufio.NewReader(reader))
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	return processZimArchive(ctx, archive, file, s.sink, &s.mu, &s.metrics)
+}
+
+func processZimArchive(ctx context.Context, archive zimArchive, file DumpFile, sink Sink, mu *sync.Mutex, metrics *metricsState) error {
+	return archive.Walk(ctx, func(entry zimEntry) error {
+		if !isArticleEntry(entry) {
+			return nil
 		}
-		token, err := decoder.Token()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-		start, ok := token.(xml.StartElement)
-		if !ok || start.Name.Local != "page" {
-			continue
-		}
-		var page xmlPage
-		if err := decoder.DecodeElement(&page, &start); err != nil {
-			return err
-		}
-		title := strings.TrimSpace(page.Title)
+		title := strings.TrimSpace(entry.Title())
 		if title == "" {
-			continue
+			return nil
+		}
+		key := articleKey(entry)
+		if key == "" {
+			return nil
+		}
+		content, err := entry.Data()
+		if err != nil {
+			return err
+		}
+		if len(content) == 0 {
+			return nil
 		}
 		payload := &pageproto.Page{
 			SrcUrl:   buildPageURL(file.Language, title),
 			HttpCode: 200,
-			Content:  []byte(page.Revision.Text.Value),
+			Content:  content,
 			Ip:       wikipediaIP(),
 		}
 		data, err := pageproto.Marshal(payload)
@@ -664,8 +663,8 @@ func (s *Service) processDump(ctx context.Context, path string, file DumpFile) e
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if err := s.sink.Send(ctx, []byte(title), data); err != nil {
-				log.Printf("sink error for %s: %v", title, err)
+			if err := sink.Send(ctx, []byte(key), data); err != nil {
+				log.Printf("sink error for %s: %v", key, err)
 				if !sleepWithContext(ctx, sendRetry) {
 					return context.Canceled
 				}
@@ -673,51 +672,219 @@ func (s *Service) processDump(ctx context.Context, path string, file DumpFile) e
 			}
 			break
 		}
-		s.mu.Lock()
-		s.metrics.ProcessedPages++
-		s.mu.Unlock()
+		if mu != nil && metrics != nil {
+			mu.Lock()
+			metrics.ProcessedPages++
+			mu.Unlock()
+		}
+		return nil
+	})
+}
+
+func isArticleEntry(entry zimEntry) bool {
+	if entry == nil {
+		return false
 	}
+	if entry.Namespace() != 'A' {
+		return false
+	}
+	mime := strings.ToLower(entry.MimeType())
+	if mime == "" {
+		return false
+	}
+	if !strings.HasPrefix(mime, "text/html") && !strings.HasPrefix(mime, "application/xhtml") {
+		return false
+	}
+	title := strings.TrimSpace(entry.Title())
+	if title == "" {
+		return false
+	}
+	slug := strings.ToLower(articleSlug(entry))
+	if slug == "" {
+		slug = strings.ToLower(strings.ReplaceAll(title, " ", "_"))
+	}
+	slug = strings.Trim(slug, "/")
+	if slug == "" {
+		return false
+	}
+	base := slug
+	if idx := strings.LastIndex(base, "/"); idx >= 0 {
+		base = base[idx+1:]
+	}
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return false
+	}
+	switch base {
+	case "readme", "metadata", "meta", "description", "favicon", "license", "copyright":
+		return false
+	}
+	return true
 }
 
-type xmlPage struct {
-	Title    string      `xml:"title"`
-	Revision xmlRevision `xml:"revision"`
+func articleKey(entry zimEntry) string {
+	slug := articleSlug(entry)
+	if slug == "" {
+		slug = entry.Title()
+	}
+	slug = strings.TrimSpace(slug)
+	if slug == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(slug, "/"); idx >= 0 {
+		slug = slug[idx+1:]
+	}
+	slug = strings.ReplaceAll(slug, " ", "_")
+	slug = strings.ReplaceAll(slug, "/", "_")
+	if slug == "" {
+		return ""
+	}
+	return slug
 }
 
-type xmlRevision struct {
-	Text xmlText `xml:"text"`
+func articleSlug(entry zimEntry) string {
+	url := entry.URL()
+	if url == "" {
+		return ""
+	}
+	if idx := strings.Index(url, "/"); idx >= 0 {
+		url = url[idx+1:]
+	}
+	if idx := strings.LastIndex(url, "/"); idx >= 0 {
+		url = url[idx+1:]
+	}
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return ""
+	}
+	if strings.HasPrefix(url, "wiki/") {
+		url = url[len("wiki/"):]
+	}
+	if idx := strings.Index(url, "?"); idx >= 0 {
+		url = url[:idx]
+	}
+	if idx := strings.Index(url, "#"); idx >= 0 {
+		url = url[:idx]
+	}
+	if idx := strings.LastIndex(url, "."); idx >= 0 {
+		ext := strings.ToLower(url[idx+1:])
+		if ext == "html" || ext == "htm" {
+			url = url[:idx]
+		}
+	}
+	return url
 }
 
-type xmlText struct {
-	Value string `xml:",chardata"`
+type zimOpener func(path string) (zimArchive, error)
+
+type zimArchive interface {
+	Close() error
+	Walk(ctx context.Context, fn func(zimEntry) error) error
 }
 
-func openDump(path string) (io.ReadCloser, error) {
-	file, err := os.Open(path)
+type zimEntry interface {
+	Namespace() byte
+	Title() string
+	URL() string
+	MimeType() string
+	Data() ([]byte, error)
+}
+
+func openZimArchive(path string) (zimArchive, error) {
+	reader, err := zim.NewReader(path, false)
 	if err != nil {
 		return nil, err
 	}
-	switch {
-	case strings.HasSuffix(path, ".bz2"):
-		return &bzReader{Reader: bzip2.NewReader(file), Closer: file}, nil
-	case strings.HasSuffix(path, ".gz"):
-		gz, err := gzip.NewReader(file)
-		if err != nil {
-			file.Close()
-			return nil, err
-		}
-		return gz, nil
-	default:
-		return file, nil
+	return &goZimArchive{reader: reader}, nil
+}
+
+type goZimArchive struct {
+	reader *zim.ZimReader
+}
+
+func (a *goZimArchive) Close() error {
+	if a.reader == nil {
+		return nil
 	}
+	return a.reader.Close()
 }
 
-type bzReader struct {
-	io.Reader
-	Closer io.Closer
+func (a *goZimArchive) Walk(ctx context.Context, fn func(zimEntry) error) error {
+	if a.reader == nil {
+		return nil
+	}
+	for idx := uint32(1); idx < a.reader.ArticleCount; idx++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		article, err := a.reader.ArticleAtURLIdx(idx)
+		if err != nil {
+			continue
+		}
+		if article == nil {
+			continue
+		}
+		if err := fn(goZimEntry{article: article}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (b *bzReader) Close() error { return b.Closer.Close() }
+type goZimEntry struct {
+	article *zim.Article
+}
+
+func (e goZimEntry) Namespace() byte {
+	if e.article == nil {
+		return 0
+	}
+	return e.article.Namespace
+}
+
+func (e goZimEntry) Title() string {
+	if e.article == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.article.Title)
+}
+
+func (e goZimEntry) URL() string {
+	if e.article == nil {
+		return ""
+	}
+	return e.article.FullURL()
+}
+
+func (e goZimEntry) MimeType() string {
+	if e.article == nil {
+		return ""
+	}
+	return e.article.MimeType()
+}
+
+func (e goZimEntry) Data() ([]byte, error) {
+	if e.article == nil {
+		return nil, nil
+	}
+	return e.article.Data()
+}
+
+func ConvertFile(ctx context.Context, cfg config.Config, sink Sink, path string) error {
+	archive, err := openZimArchive(path)
+	if err != nil {
+		return err
+	}
+	defer archive.Close()
+
+	name := filepath.Base(path)
+	lang := datasetLanguage(strings.TrimSuffix(name, ".zim"))
+	if lang == "" {
+		return fmt.Errorf("cannot determine language from %s", name)
+	}
+	file := DumpFile{Name: name, Language: lang}
+	return processZimArchive(ctx, archive, file, sink, nil, nil)
+}
 
 func buildPageURL(lang, title string) string {
 	slug := strings.ReplaceAll(title, " ", "_")

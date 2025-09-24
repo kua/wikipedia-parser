@@ -2,10 +2,10 @@ package exporter
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -35,8 +35,23 @@ func (m *memorySink) Send(ctx context.Context, key, value []byte) error {
 
 func TestServiceRun(t *testing.T) {
 	tmp := t.TempDir()
-	xml := `<mediawiki><page><title>Foo Bar</title><revision><text>hello</text></revision></page><page><title>Baz</title><revision><text>world</text></revision></page></mediawiki>`
-	gzData := gzipData([]byte(xml))
+	archives := map[string]*fakeZimArchive{
+		"wikipedia_en_history_nopic_20240101.zim": {
+			entries: []fakeZimEntry{
+				{namespace: 'A', title: "Alpha", url: "A/Alpha", mime: "text/html", data: []byte("<html>alpha</html>")},
+				{namespace: 'A', title: "Foo Bar", url: "A/Foo_Bar", mime: "text/html", data: []byte("<html>foo</html>")},
+				{namespace: 'A', title: "README", url: "A/README", mime: "text/html", data: []byte("<html>ignore</html>")},
+				{namespace: 'I', title: "Image", url: "I/image.png", mime: "image/png", data: []byte("binary")},
+				{namespace: 'A', title: "notes", url: "A/notes.htm", mime: "text/html", data: []byte("<html>note</html>")},
+			},
+		},
+		"wikipedia_ru_science_nopic_20240101.zim": {
+			entries: []fakeZimEntry{
+				{namespace: 'A', title: "Privet", url: "A/Privet", mime: "text/html", data: []byte("<html>privet</html>")},
+				{namespace: 'A', title: "meta", url: "A/meta.json", mime: "application/json", data: []byte("{}")},
+			},
+		},
+	}
 
 	type requestLog struct {
 		mu    sync.Mutex
@@ -48,16 +63,14 @@ func TestServiceRun(t *testing.T) {
 		reqLog.agent[r.URL.Path] = r.Header.Get("User-Agent")
 		reqLog.mu.Unlock()
 		switch r.URL.Path {
-		case "/conf/dblists/wikipedia.dblist":
-			w.Write([]byte("enwiki\nruwiki\n"))
-		case "/enwiki/latest/":
-			w.Write([]byte(`<a href="enwiki-latest-pages-articles1.xml-p1p2.gz">chunk</a>`))
-		case "/ruwiki/latest/":
-			w.Write([]byte(`<a href="ruwiki-latest-pages-articles1.xml-p1p2.gz">chunk</a>`))
-		case "/enwiki/latest/enwiki-latest-pages-articles1.xml-p1p2.gz":
-			w.Write(gzData)
-		case "/ruwiki/latest/ruwiki-latest-pages-articles1.xml-p1p2.gz":
-			w.Write(gzData)
+		case "/kiwix/zim/wikipedia/":
+			w.Write([]byte(`<a href="wikipedia_en_history_nopic_20240101.zim">en-history</a><a href="wikipedia_en_all_nopic_20240101.zim">skip-all</a><a href="wikipedia_ru_science_nopic_20240101.zim">ru-science</a><a href="speedtest_en_blob_2024-05.zim">speed</a>`))
+		case "/kiwix/zim/wikipedia/wikipedia_en_history_nopic_20240101.zim":
+			w.Write([]byte("zimdata"))
+		case "/kiwix/zim/wikipedia/wikipedia_en_all_nopic_20240101.zim":
+			http.Error(w, "should not fetch", http.StatusBadRequest)
+		case "/kiwix/zim/wikipedia/wikipedia_ru_science_nopic_20240101.zim":
+			w.Write([]byte("zimdata"))
 		default:
 			http.NotFound(w, r)
 		}
@@ -66,29 +79,50 @@ func TestServiceRun(t *testing.T) {
 
 	client := server.Client()
 	cfg := config.Config{
-		DumpBaseURL: server.URL,
+		DumpBaseURL: server.URL + "/kiwix/zim/wikipedia",
 		WorkDir:     tmp,
 		HTTPAddr:    ":0",
 		Sink:        "stdout",
 		StatusFile:  filepath.Join(tmp, "status.log"),
 	}
-	lister := &httpLister{base: cfg.DumpBaseURL, client: client, dblistURL: server.URL + "/conf/dblists/wikipedia.dblist"}
+	lister := NewHTTPDumpLister(cfg.DumpBaseURL, client)
 	sink := &memorySink{}
 	svc := NewServiceWithLister(cfg, client, sink, lister)
+	svc.openZim = func(path string) (zimArchive, error) {
+		name := filepath.Base(path)
+		archive, ok := archives[name]
+		if !ok {
+			return nil, fmt.Errorf("unknown archive %s", name)
+		}
+		return archive, nil
+	}
 
 	if err := svc.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	svc.Wait()
 
-	if len(sink.pages) != 4 {
-		t.Fatalf("expected 4 pages, got %d", len(sink.pages))
+	expected := map[string]string{
+		"https://en.wikipedia.org/wiki/Alpha":   "<html>alpha</html>",
+		"https://en.wikipedia.org/wiki/Foo_Bar": "<html>foo</html>",
+		"https://en.wikipedia.org/wiki/notes":   "<html>note</html>",
+		"https://ru.wikipedia.org/wiki/Privet":  "<html>privet</html>",
 	}
-	if sink.pages[0].GetSrcUrl() != "https://en.wikipedia.org/wiki/Foo_Bar" {
-		t.Fatalf("unexpected src url: %s", sink.pages[0].GetSrcUrl())
+	if len(sink.pages) != len(expected) {
+		t.Fatalf("expected %d pages, got %d", len(expected), len(sink.pages))
 	}
-	if sink.pages[0].GetHttpCode() != 200 || sink.pages[0].GetIp() == 0 {
-		t.Fatalf("unexpected page fields: %+v", sink.pages[0])
+	for _, page := range sink.pages {
+		if page.GetHttpCode() != 200 || page.GetIp() == 0 {
+			t.Fatalf("unexpected page fields: %+v", page)
+		}
+		content := string(page.GetContent())
+		want, ok := expected[page.GetSrcUrl()]
+		if !ok {
+			t.Fatalf("unexpected src url: %s", page.GetSrcUrl())
+		}
+		if content != want {
+			t.Fatalf("unexpected content for %s: %q", page.GetSrcUrl(), content)
+		}
 	}
 
 	list := svc.List()
@@ -113,22 +147,25 @@ func TestServiceRun(t *testing.T) {
 	if len(state.Completed) != 2 {
 		t.Fatalf("expected 2 completed items, got %v", state.Completed)
 	}
-	if _, ok := state.Files["enwiki-latest-pages-articles1.xml-p1p2.gz"]; !ok {
-		t.Fatalf("status missing enwiki file: %+v", state.Files)
+	expectedFiles := []string{
+		"wikipedia_en_history_nopic_20240101.zim",
+		"wikipedia_ru_science_nopic_20240101.zim",
 	}
-	for _, name := range []string{
-		"enwiki-latest-pages-articles1.xml-p1p2.gz",
-		"ruwiki-latest-pages-articles1.xml-p1p2.gz",
-	} {
+	for _, name := range expectedFiles {
+		if _, ok := state.Files[name]; !ok {
+			t.Fatalf("status missing %s file: %+v", name, state.Files)
+		}
+	}
+	for _, name := range expectedFiles {
 		if _, err := os.Stat(filepath.Join(tmp, name)); err == nil || !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("dump file still present %s: %v", name, err)
 		}
 	}
 
-	if agent := reqLog.agent["/conf/dblists/wikipedia.dblist"]; agent != chromeUA {
-		t.Fatalf("unexpected dblist user agent: %q", agent)
+	if agent := reqLog.agent["/kiwix/zim/wikipedia/"]; agent != chromeUA {
+		t.Fatalf("unexpected index user agent: %q", agent)
 	}
-	if agent := reqLog.agent["/enwiki/latest/enwiki-latest-pages-articles1.xml-p1p2.gz"]; agent != chromeUA {
+	if agent := reqLog.agent["/kiwix/zim/wikipedia/wikipedia_en_history_nopic_20240101.zim"]; agent != chromeUA {
 		t.Fatalf("unexpected download user agent: %q", agent)
 	}
 
@@ -142,6 +179,7 @@ func TestServiceRun(t *testing.T) {
 	}
 
 	svc2 := NewServiceWithLister(cfg, client, sink, lister)
+	svc2.openZim = svc.openZim
 	if err := svc2.Start(context.Background()); err != nil {
 		t.Fatalf("restart: %v", err)
 	}
@@ -151,10 +189,31 @@ func TestServiceRun(t *testing.T) {
 	}
 }
 
-func gzipData(data []byte) []byte {
-	buf := &bytes.Buffer{}
-	gz := gzip.NewWriter(buf)
-	gz.Write(data)
-	gz.Close()
-	return buf.Bytes()
+type fakeZimArchive struct {
+	entries []fakeZimEntry
 }
+
+func (f *fakeZimArchive) Close() error { return nil }
+
+func (f *fakeZimArchive) Walk(ctx context.Context, fn func(zimEntry) error) error {
+	for _, entry := range f.entries {
+		if err := fn(entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type fakeZimEntry struct {
+	namespace byte
+	title     string
+	url       string
+	mime      string
+	data      []byte
+}
+
+func (f fakeZimEntry) Namespace() byte       { return f.namespace }
+func (f fakeZimEntry) Title() string         { return f.title }
+func (f fakeZimEntry) URL() string           { return f.url }
+func (f fakeZimEntry) MimeType() string      { return f.mime }
+func (f fakeZimEntry) Data() ([]byte, error) { return f.data, nil }

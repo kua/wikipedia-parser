@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
-	"strconv"
 	"strings"
 )
 
 func NewHTTPDumpLister(baseURL string, client *http.Client) DumpLister {
+	// Trim the trailing slash so url.JoinPath doesn't introduce double separators
+	// when we later append file names. A bare root URL ("/") remains untouched.
 	base := strings.TrimSuffix(baseURL, "/")
 	return &httpLister{base: base, client: client}
 }
@@ -23,85 +25,81 @@ type httpLister struct {
 	client *http.Client
 }
 
-func (l *httpLister) List(ctx context.Context) (Inventory, error) {
+func (l *httpLister) List(ctx context.Context) ([]DumpFile, error) {
 	links, err := l.fetchLinks(ctx, l.base+"/")
 	if err != nil {
-		return Inventory{}, err
+		return nil, err
 	}
-	latestByDataset := make(map[string]DumpFile)
-	errs := make([]string, 0)
+
+	datasets := make(map[string]map[string]DumpFile)
 	for _, link := range links {
-		file, ok := l.parseRootEntry(link)
+		file, ok := parseDumpLink(link)
 		if !ok {
 			continue
 		}
 		abs, err := url.JoinPath(l.base, file.Name)
 		if err != nil {
 			log.Printf("build dump url failed for %s: %v", file.Name, err)
-			errs = append(errs, fmt.Sprintf("%s: %v", file.Name, err))
 			continue
 		}
 		file.URL = abs
-		current, exists := latestByDataset[file.Dataset]
-		if !exists || versionLess(current.Version, file.Version) {
-			latestByDataset[file.Dataset] = file
+
+		versions := datasets[file.Dataset]
+		if versions == nil {
+			versions = make(map[string]DumpFile)
+			datasets[file.Dataset] = versions
 		}
+		versions[file.Version] = file
 	}
 
-	langMaxVersion := make(map[string]string)
+	latestByDataset := make([]DumpFile, 0, len(datasets))
+	for _, versions := range datasets {
+		keys := make([]string, 0, len(versions))
+		for version := range versions {
+			keys = append(keys, version)
+		}
+		if len(keys) == 0 {
+			continue
+		}
+		latestByDataset = append(latestByDataset, versions[slices.Max(keys)])
+	}
+
+	langMax := make(map[string]string, len(latestByDataset))
 	for _, file := range latestByDataset {
-		maxVersion, exists := langMaxVersion[file.Language]
-		if !exists || versionLess(maxVersion, file.Version) {
-			langMaxVersion[file.Language] = file.Version
+		if current, ok := langMax[file.Language]; !ok || current < file.Version {
+			langMax[file.Language] = file.Version
 		}
 	}
 
 	files := make([]DumpFile, 0, len(latestByDataset))
-	langSet := make(map[string]struct{}, len(latestByDataset))
 	for _, file := range latestByDataset {
-		maxVersion, ok := langMaxVersion[file.Language]
-		if !ok || file.Version != maxVersion {
-			continue
+		if file.Version == langMax[file.Language] {
+			files = append(files, file)
 		}
-		files = append(files, file)
-		langSet[file.Language] = struct{}{}
 	}
 
-	languages := make([]string, 0, len(langSet))
-	for lang := range langSet {
-		languages = append(languages, lang)
-	}
-	sort.Strings(languages)
 	sort.Slice(files, func(i, j int) bool {
 		if files[i].Language == files[j].Language {
 			return files[i].Name < files[j].Name
 		}
 		return files[i].Language < files[j].Language
 	})
-	return Inventory{Languages: languages, Files: files, Errors: errs}, nil
+
+	return files, nil
 }
 
-func (l *httpLister) parseRootEntry(link string) (DumpFile, bool) {
-	if link == "" {
+func parseDumpLink(name string) (DumpFile, bool) {
+	if name == "" || strings.Contains(name, "/") {
 		return DumpFile{}, false
 	}
-	if strings.Contains(link, "/") {
+	lower := strings.ToLower(name)
+	if !strings.HasPrefix(lower, "wikipedia_") || !strings.HasSuffix(lower, ".zim") {
 		return DumpFile{}, false
 	}
-	lower := strings.ToLower(link)
-	if !strings.HasPrefix(lower, "wikipedia_") {
+	if !strings.Contains(lower, "_nopic_") || strings.Contains(lower, "_all_nopic_") {
 		return DumpFile{}, false
 	}
-	if !strings.HasSuffix(lower, ".zim") {
-		return DumpFile{}, false
-	}
-	if !strings.Contains(lower, "_nopic_") {
-		return DumpFile{}, false
-	}
-	if strings.Contains(lower, "_all_nopic_") {
-		return DumpFile{}, false
-	}
-	dataset, version, ok := splitDatasetVersion(link)
+	dataset, version, ok := splitDatasetVersion(name)
 	if !ok {
 		return DumpFile{}, false
 	}
@@ -109,24 +107,20 @@ func (l *httpLister) parseRootEntry(link string) (DumpFile, bool) {
 	if lang == "" {
 		return DumpFile{}, false
 	}
-	return DumpFile{Name: link, Language: lang, Dataset: dataset, Version: version}, true
+	return DumpFile{Name: name, Language: lang, Dataset: dataset, Version: version}, true
 }
 
-func splitDatasetVersion(name string) (string, string, bool) {
-	if !strings.HasSuffix(name, ".zim") {
+func splitDatasetVersion(name string) (dataset, version string, ok bool) {
+	base, hasSuffix := strings.CutSuffix(name, ".zim")
+	if !hasSuffix {
 		return "", "", false
 	}
-	base := strings.TrimSuffix(name, ".zim")
 	idx := strings.LastIndex(base, "_")
-	if idx <= 0 || idx >= len(base)-1 {
+	if idx < 0 {
 		return "", "", false
 	}
-	dataset := base[:idx]
-	version := base[idx+1:]
-	if dataset == "" || version == "" {
-		return "", "", false
-	}
-	if !isValidVersion(version) {
+	dataset, version = base[:idx], base[idx+1:]
+	if dataset == "" || version == "" || !isValidVersion(version) {
 		return "", "", false
 	}
 	return dataset, version, true
@@ -134,57 +128,11 @@ func splitDatasetVersion(name string) (string, string, bool) {
 
 func isValidVersion(version string) bool {
 	for _, r := range version {
-		if r == '-' {
-			continue
-		}
-		if r < '0' || r > '9' {
+		if r != '-' && (r < '0' || r > '9') {
 			return false
 		}
 	}
 	return true
-}
-
-func normalizeVersion(version string) (int, bool) {
-	if version == "" {
-		return 0, false
-	}
-	digits := strings.Builder{}
-	digits.Grow(len(version))
-	for _, r := range version {
-		if r == '-' {
-			continue
-		}
-		if r < '0' || r > '9' {
-			return 0, false
-		}
-		digits.WriteRune(r)
-	}
-	if digits.Len() == 0 {
-		return 0, false
-	}
-	value, err := strconv.Atoi(digits.String())
-	if err != nil {
-		return 0, false
-	}
-	return value, true
-}
-
-func versionLess(current, candidate string) bool {
-	if current == "" {
-		return true
-	}
-	if candidate == "" {
-		return false
-	}
-	curVal, okCur := normalizeVersion(current)
-	candVal, okCand := normalizeVersion(candidate)
-	if okCur && okCand {
-		if curVal != candVal {
-			return curVal < candVal
-		}
-		return len(current) < len(candidate)
-	}
-	return current < candidate
 }
 
 func (l *httpLister) fetchLinks(ctx context.Context, target string) ([]string, error) {
@@ -208,11 +156,9 @@ func (l *httpLister) fetchLinks(ctx context.Context, target string) ([]string, e
 	matches := linkPattern.FindAllStringSubmatch(string(body), -1)
 	links := make([]string, 0, len(matches))
 	for _, m := range matches {
-		cleaned := cleanLink(m[1])
-		if cleaned == "" {
-			continue
+		if cleaned := cleanLink(m[1]); cleaned != "" {
+			links = append(links, cleaned)
 		}
-		links = append(links, cleaned)
 	}
 	return links, nil
 }
@@ -221,13 +167,12 @@ var linkPattern = regexp.MustCompile(`href="([^"]+)"`)
 
 func cleanLink(link string) string {
 	link = strings.TrimSpace(link)
-	if link == "" {
+	switch {
+	case link == "":
 		return ""
-	}
-	if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") || strings.HasPrefix(link, "//") {
+	case strings.HasPrefix(link, "http://"), strings.HasPrefix(link, "https://"), strings.HasPrefix(link, "//"):
 		return ""
-	}
-	if strings.HasPrefix(link, "#") {
+	case strings.HasPrefix(link, "#"):
 		return ""
 	}
 	if strings.Contains(link, "../") {
@@ -236,16 +181,12 @@ func cleanLink(link string) string {
 	if idx := strings.IndexAny(link, "?#"); idx >= 0 {
 		link = link[:idx]
 	}
-	link = strings.TrimPrefix(link, "./")
-	return link
+	return strings.TrimPrefix(link, "./")
 }
 
 func datasetLanguage(name string) string {
 	parts := strings.Split(name, "_")
-	if len(parts) < 3 {
-		return ""
-	}
-	if parts[0] != "wikipedia" {
+	if len(parts) < 3 || parts[0] != "wikipedia" {
 		return ""
 	}
 	return parts[1]

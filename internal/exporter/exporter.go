@@ -62,14 +62,8 @@ type DumpFile struct {
 	Version  string `json:"version,omitempty"`
 }
 
-type Inventory struct {
-	Languages []string   `json:"languages"`
-	Files     []DumpFile `json:"files"`
-	Errors    []string   `json:"errors"`
-}
-
 type DumpLister interface {
-	List(ctx context.Context) (Inventory, error)
+        List(ctx context.Context) ([]DumpFile, error)
 }
 
 type ListResult struct {
@@ -342,14 +336,14 @@ func (s *Service) prepareJob(ctx context.Context) (exportState, []DumpFile, erro
 }
 
 func (s *Service) buildFreshState(ctx context.Context) (exportState, error) {
-	inv, err := s.lister.List(ctx)
-	if err != nil {
-		return exportState{}, err
-	}
-	files := append([]DumpFile(nil), inv.Files...)
-	sort.Slice(files, func(i, j int) bool {
-		if files[i].Language == files[j].Language {
-			return files[i].Name < files[j].Name
+        files, err := s.lister.List(ctx)
+        if err != nil {
+                return exportState{}, err
+        }
+        files = append([]DumpFile(nil), files...)
+        sort.Slice(files, func(i, j int) bool {
+                if files[i].Language == files[j].Language {
+                        return files[i].Name < files[j].Name
 		}
 		return files[i].Language < files[j].Language
 	})
@@ -419,11 +413,11 @@ func (s *Service) List() ListResult {
 }
 
 func (s *Service) ListAll(ctx context.Context) (ListAllResult, error) {
-	inv, err := s.lister.List(ctx)
-	if err != nil {
-		return ListAllResult{Errors: []string{err.Error()}}, err
-	}
-	return ListAllResult{Files: inv.Files, Errors: inv.Errors}, nil
+        files, err := s.lister.List(ctx)
+        if err != nil {
+                return ListAllResult{Errors: []string{err.Error()}}, err
+        }
+        return ListAllResult{Files: files}, nil
 }
 
 func (s *Service) MetricsHandler() http.Handler {

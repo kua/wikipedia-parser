@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -27,15 +28,13 @@ func (l *httpLister) List(ctx context.Context) (Inventory, error) {
 	if err != nil {
 		return Inventory{}, err
 	}
-	files := make([]DumpFile, 0)
+	latest := make(map[string]DumpFile)
 	errs := make([]string, 0)
-	langSet := make(map[string]struct{})
 	for _, link := range links {
 		file, ok := l.parseRootEntry(link)
 		if !ok {
 			continue
 		}
-		langSet[file.Language] = struct{}{}
 		abs, err := url.JoinPath(l.base, file.Name)
 		if err != nil {
 			log.Printf("build dump url failed for %s: %v", file.Name, err)
@@ -43,7 +42,17 @@ func (l *httpLister) List(ctx context.Context) (Inventory, error) {
 			continue
 		}
 		file.URL = abs
+		current, exists := latest[file.Dataset]
+		if !exists || versionLess(current.Version, file.Version) {
+			latest[file.Dataset] = file
+		}
+	}
+
+	files := make([]DumpFile, 0, len(latest))
+	langSet := make(map[string]struct{}, len(latest))
+	for _, file := range latest {
 		files = append(files, file)
+		langSet[file.Language] = struct{}{}
 	}
 
 	languages := make([]string, 0, len(langSet))
@@ -80,11 +89,90 @@ func (l *httpLister) parseRootEntry(link string) (DumpFile, bool) {
 	if strings.Contains(lower, "_all_nopic_") {
 		return DumpFile{}, false
 	}
-	lang := datasetLanguage(strings.TrimSuffix(link, ".zim"))
+	dataset, version, ok := splitDatasetVersion(link)
+	if !ok {
+		return DumpFile{}, false
+	}
+	lang := datasetLanguage(dataset)
 	if lang == "" {
 		return DumpFile{}, false
 	}
-	return DumpFile{Name: link, Language: lang}, true
+	return DumpFile{Name: link, Language: lang, Dataset: dataset, Version: version}, true
+}
+
+func splitDatasetVersion(name string) (string, string, bool) {
+	if !strings.HasSuffix(name, ".zim") {
+		return "", "", false
+	}
+	base := strings.TrimSuffix(name, ".zim")
+	idx := strings.LastIndex(base, "_")
+	if idx <= 0 || idx >= len(base)-1 {
+		return "", "", false
+	}
+	dataset := base[:idx]
+	version := base[idx+1:]
+	if dataset == "" || version == "" {
+		return "", "", false
+	}
+	if !isValidVersion(version) {
+		return "", "", false
+	}
+	return dataset, version, true
+}
+
+func isValidVersion(version string) bool {
+	for _, r := range version {
+		if r == '-' {
+			continue
+		}
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeVersion(version string) (int, bool) {
+	if version == "" {
+		return 0, false
+	}
+	digits := strings.Builder{}
+	digits.Grow(len(version))
+	for _, r := range version {
+		if r == '-' {
+			continue
+		}
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+		digits.WriteRune(r)
+	}
+	if digits.Len() == 0 {
+		return 0, false
+	}
+	value, err := strconv.Atoi(digits.String())
+	if err != nil {
+		return 0, false
+	}
+	return value, true
+}
+
+func versionLess(current, candidate string) bool {
+	if current == "" {
+		return true
+	}
+	if candidate == "" {
+		return false
+	}
+	curVal, okCur := normalizeVersion(current)
+	candVal, okCand := normalizeVersion(candidate)
+	if okCur && okCand {
+		if curVal != candVal {
+			return curVal < candVal
+		}
+		return len(current) < len(candidate)
+	}
+	return current < candidate
 }
 
 func (l *httpLister) fetchLinks(ctx context.Context, target string) ([]string, error) {

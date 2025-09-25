@@ -37,7 +37,7 @@ func (m *memorySink) Send(ctx context.Context, key, value []byte) error {
 func TestServiceRun(t *testing.T) {
 	tmp := t.TempDir()
 	archives := map[string]*fakeZimArchive{
-		"wikipedia_en_history_nopic_20240101.zim": {
+		"wikipedia_en_history_nopic_2024-01.zim": {
 			entries: []fakeZimEntry{
 				{title: "Alpha", url: "A/Alpha", mime: "text/html", data: []byte("<html>alpha</html>")},
 				{title: "Foo Bar", url: "A/Foo_Bar", mime: "text/html", data: []byte("<html>foo</html>")},
@@ -47,10 +47,16 @@ func TestServiceRun(t *testing.T) {
 				{title: "notes", url: "A/notes.htm", mime: "text/html", data: []byte("<html>note</html>")},
 			},
 		},
-		"wikipedia_ru_science_nopic_20240101.zim": {
+		"wikipedia_ru_science_nopic_2024-01.zim": {
 			entries: []fakeZimEntry{
 				{title: "Privet", url: "A/Privet", mime: "text/html", data: []byte("<html>privet</html>")},
 				{title: "meta", url: "A/meta.json", mime: "application/json", data: []byte("{}")},
+			},
+		},
+		"wikipedia_ar_basketball_nopic_2025-09.zim": {
+			entries: []fakeZimEntry{
+				{title: "Basket", url: "A/Basket", mime: "text/html", data: []byte("<html>ball</html>")},
+				{title: "Logo", url: "I/logo.svg", mime: "image/svg+xml", data: []byte("<svg/>")},
 			},
 		},
 	}
@@ -66,12 +72,16 @@ func TestServiceRun(t *testing.T) {
 		reqLog.mu.Unlock()
 		switch r.URL.Path {
 		case "/kiwix/zim/wikipedia/":
-			w.Write([]byte(`<a href="wikipedia_en_history_nopic_20240101.zim">en-history</a><a href="wikipedia_en_all_nopic_20240101.zim">skip-all</a><a href="wikipedia_ru_science_nopic_20240101.zim">ru-science</a><a href="speedtest_en_blob_2024-05.zim">speed</a>`))
-		case "/kiwix/zim/wikipedia/wikipedia_en_history_nopic_20240101.zim":
+			w.Write([]byte(`<a href="wikipedia_en_history_nopic_2024-01.zim">en-history</a><a href="wikipedia_en_all_nopic_2024-01.zim">skip-all</a><a href="wikipedia_ru_science_nopic_2024-01.zim">ru-science</a><a href="wikipedia_ar_basketball_nopic_2025-08.zim">ar-basketball-old</a><a href="wikipedia_ar_basketball_nopic_2025-09.zim">ar-basketball-new</a><a href="speedtest_en_blob_2024-05.zim">speed</a>`))
+		case "/kiwix/zim/wikipedia/wikipedia_en_history_nopic_2024-01.zim":
 			w.Write([]byte("zimdata"))
-		case "/kiwix/zim/wikipedia/wikipedia_en_all_nopic_20240101.zim":
+		case "/kiwix/zim/wikipedia/wikipedia_en_all_nopic_2024-01.zim":
 			http.Error(w, "should not fetch", http.StatusBadRequest)
-		case "/kiwix/zim/wikipedia/wikipedia_ru_science_nopic_20240101.zim":
+		case "/kiwix/zim/wikipedia/wikipedia_ru_science_nopic_2024-01.zim":
+			w.Write([]byte("zimdata"))
+		case "/kiwix/zim/wikipedia/wikipedia_ar_basketball_nopic_2025-08.zim":
+			http.Error(w, "old version", http.StatusBadRequest)
+		case "/kiwix/zim/wikipedia/wikipedia_ar_basketball_nopic_2025-09.zim":
 			w.Write([]byte("zimdata"))
 		default:
 			http.NotFound(w, r)
@@ -110,6 +120,7 @@ func TestServiceRun(t *testing.T) {
 		"https://en.wikipedia.org/wiki/notes":   "<html>note</html>",
 		"https://ru.wikipedia.org/wiki/Privet":  "<html>privet</html>",
 		"https://en.wikipedia.org/wiki/Packed":  "<html>packed</html>",
+		"https://ar.wikipedia.org/wiki/Basket":  "<html>ball</html>",
 	}
 	if len(sink.pages) != len(expected) {
 		t.Fatalf("expected %d pages, got %d", len(expected), len(sink.pages))
@@ -132,8 +143,8 @@ func TestServiceRun(t *testing.T) {
 	if len(list.Pending) != 0 {
 		t.Fatalf("expected no pending files, got %v", list.Pending)
 	}
-	if len(list.Processed) != 2 {
-		t.Fatalf("expected 2 processed files, got %v", list.Processed)
+	if len(list.Processed) != 3 {
+		t.Fatalf("expected 3 processed files, got %v", list.Processed)
 	}
 
 	data, err := os.ReadFile(cfg.StatusFile)
@@ -147,12 +158,13 @@ func TestServiceRun(t *testing.T) {
 	if len(state.Pending) != 0 {
 		t.Fatalf("expected no pending items, got %v", state.Pending)
 	}
-	if len(state.Completed) != 2 {
-		t.Fatalf("expected 2 completed items, got %v", state.Completed)
+	if len(state.Completed) != 3 {
+		t.Fatalf("expected 3 completed items, got %v", state.Completed)
 	}
 	expectedFiles := []string{
-		"wikipedia_en_history_nopic_20240101.zim",
-		"wikipedia_ru_science_nopic_20240101.zim",
+		"wikipedia_en_history_nopic_2024-01.zim",
+		"wikipedia_ru_science_nopic_2024-01.zim",
+		"wikipedia_ar_basketball_nopic_2025-09.zim",
 	}
 	for _, name := range expectedFiles {
 		if _, ok := state.Files[name]; !ok {
@@ -168,8 +180,11 @@ func TestServiceRun(t *testing.T) {
 	if agent := reqLog.agent["/kiwix/zim/wikipedia/"]; agent != chromeUA {
 		t.Fatalf("unexpected index user agent: %q", agent)
 	}
-	if agent := reqLog.agent["/kiwix/zim/wikipedia/wikipedia_en_history_nopic_20240101.zim"]; agent != chromeUA {
+	if agent := reqLog.agent["/kiwix/zim/wikipedia/wikipedia_en_history_nopic_2024-01.zim"]; agent != chromeUA {
 		t.Fatalf("unexpected download user agent: %q", agent)
+	}
+	if _, ok := reqLog.agent["/kiwix/zim/wikipedia/wikipedia_ar_basketball_nopic_2025-08.zim"]; ok {
+		t.Fatalf("unexpected request for old dump version")
 	}
 
 	metricsReq := httptest.NewRecorder()
@@ -187,7 +202,7 @@ func TestServiceRun(t *testing.T) {
 		t.Fatalf("restart: %v", err)
 	}
 	svc2.Wait()
-	if len(sink.pages) != 10 {
+	if len(sink.pages) != 12 {
 		t.Fatalf("expected pages to be re-exported, got %d", len(sink.pages))
 	}
 }

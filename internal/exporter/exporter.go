@@ -58,6 +58,8 @@ type DumpFile struct {
 	Name     string `json:"name"`
 	URL      string `json:"url"`
 	Language string `json:"language"`
+	Dataset  string `json:"dataset,omitempty"`
+	Version  string `json:"version,omitempty"`
 }
 
 type Inventory struct {
@@ -980,7 +982,13 @@ func ConvertFile(ctx context.Context, cfg config.Config, sink Sink, path string)
 	if lang == "" {
 		return fmt.Errorf("cannot determine language from %s", name)
 	}
-	file := DumpFile{Name: name, Language: lang}
+	dataset := strings.TrimSuffix(name, ".zim")
+	version := ""
+	if ds, ver, ok := splitDatasetVersion(name); ok {
+		dataset = ds
+		version = ver
+	}
+	file := DumpFile{Name: name, Language: lang, Dataset: dataset, Version: version}
 	return processZimArchive(ctx, archive, file, sink, nil, nil)
 }
 

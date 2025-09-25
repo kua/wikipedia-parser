@@ -62,15 +62,6 @@ type DumpFile struct {
 	Version  string `json:"version,omitempty"`
 }
 
-type DumpLister interface {
-        List(ctx context.Context) ([]DumpFile, error)
-}
-
-type ListResult struct {
-	Processed []string `json:"processed"`
-	Pending   []string `json:"pending"`
-}
-
 type ListAllResult struct {
 	Files  []DumpFile `json:"files"`
 	Errors []string   `json:"errors"`
@@ -83,33 +74,14 @@ type exportState struct {
 }
 
 type metricsState struct {
-	Status             string
-	Progress           float64
-	Elapsed            time.Duration
-	ETA                time.Duration
-	ProcessedFiles     int
-	TotalFiles         int
-	ProcessedLanguages int
-	TotalLanguages     int
-	ProcessedPages     int
-	DownloadErrors     int
-	ReadErrors         int
+	Running  bool
+	Progress float64
 }
 
 type promMetrics struct {
-	handler        http.Handler
-	progress       prometheus.Gauge
-	elapsed        prometheus.Gauge
-	eta            prometheus.Gauge
-	processedFiles prometheus.Gauge
-	totalFiles     prometheus.Gauge
-	processedLangs prometheus.Gauge
-	totalLangs     prometheus.Gauge
-	processedPages prometheus.Gauge
-	downloadErrors prometheus.Gauge
-	readErrors     prometheus.Gauge
-	status         *prometheus.GaugeVec
-	states         []string
+	handler  http.Handler
+	progress prometheus.Gauge
+	running  prometheus.Gauge
 }
 
 func newPromMetrics() *promMetrics {
@@ -117,125 +89,49 @@ func newPromMetrics() *promMetrics {
 		Name: "exporter_progress",
 		Help: "Overall progress",
 	})
-	elapsed := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "exporter_elapsed_seconds",
-		Help: "Elapsed time in seconds",
+	running := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "exporter_running",
+		Help: "Exporter running state (1 running, 0 idle)",
 	})
-	eta := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "exporter_eta_seconds",
-		Help: "Estimated time to finish in seconds",
-	})
-	processedFiles := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "exporter_processed_files",
-		Help: "Processed files",
-	})
-	totalFiles := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "exporter_total_files",
-		Help: "Total files",
-	})
-	processedLangs := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "exporter_processed_languages",
-		Help: "Processed languages",
-	})
-	totalLangs := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "exporter_total_languages",
-		Help: "Total languages",
-	})
-	processedPages := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "exporter_processed_pages",
-		Help: "Processed pages",
-	})
-	downloadErrors := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "exporter_download_errors",
-		Help: "Download errors",
-	})
-	readErrors := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "exporter_read_errors",
-		Help: "Read errors",
-	})
-	status := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "exporter_status",
-		Help: "Exporter status",
-	}, []string{"state"})
 
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(
 		progress,
-		elapsed,
-		eta,
-		processedFiles,
-		totalFiles,
-		processedLangs,
-		totalLangs,
-		processedPages,
-		downloadErrors,
-		readErrors,
-		status,
+		running,
 	)
 
-	states := []string{"idle", "running", "paused", "completed", "aborted"}
-	for _, st := range states {
-		status.WithLabelValues(st).Set(0)
-	}
-	status.WithLabelValues("idle").Set(1)
-
 	return &promMetrics{
-		handler:        promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
-		progress:       progress,
-		elapsed:        elapsed,
-		eta:            eta,
-		processedFiles: processedFiles,
-		totalFiles:     totalFiles,
-		processedLangs: processedLangs,
-		totalLangs:     totalLangs,
-		processedPages: processedPages,
-		downloadErrors: downloadErrors,
-		readErrors:     readErrors,
-		status:         status,
-		states:         states,
+		handler:  promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
+		progress: progress,
+		running:  running,
 	}
 }
 
 func (m *promMetrics) update(state metricsState) {
 	m.progress.Set(state.Progress)
-	m.elapsed.Set(state.Elapsed.Seconds())
-	m.eta.Set(state.ETA.Seconds())
-	m.processedFiles.Set(float64(state.ProcessedFiles))
-	m.totalFiles.Set(float64(state.TotalFiles))
-	m.processedLangs.Set(float64(state.ProcessedLanguages))
-	m.totalLangs.Set(float64(state.TotalLanguages))
-	m.processedPages.Set(float64(state.ProcessedPages))
-	m.downloadErrors.Set(float64(state.DownloadErrors))
-	m.readErrors.Set(float64(state.ReadErrors))
-	for _, st := range m.states {
-		value := 0.0
-		if state.Status == st {
-			value = 1
-		}
-		m.status.WithLabelValues(st).Set(value)
+	if state.Running {
+		m.running.Set(1)
+	} else {
+		m.running.Set(0)
 	}
 }
 
 type Service struct {
-	cfg    config.Config
-	client *http.Client
-	sink   Sink
-	lister DumpLister
-	status *statusFile
-	prom   *promMetrics
+	cfg       config.Config
+	client    *http.Client
+	sink      Sink
+	listDumps func(ctx context.Context) ([]DumpFile, error)
+	status    *statusFile
+	prom      *promMetrics
 
 	openZim zimOpener
 
-	mu        sync.Mutex
-	cond      *sync.Cond
-	running   bool
-	paused    bool
-	cancel    context.CancelFunc
-	done      chan struct{}
-	startTime time.Time
+	mu      sync.Mutex
+	cond    *sync.Cond
+	running bool
+	cancel  context.CancelFunc
 
 	state   exportState
-	queue   []DumpFile
 	metrics metricsState
 }
 
@@ -243,17 +139,17 @@ func NewService(cfg config.Config, client *http.Client, sink Sink) *Service {
 	return NewServiceWithLister(cfg, client, sink, NewHTTPDumpLister(cfg.DumpBaseURL, client))
 }
 
-func NewServiceWithLister(cfg config.Config, client *http.Client, sink Sink, lister DumpLister) *Service {
+func NewServiceWithLister(cfg config.Config, client *http.Client, sink Sink, listFunc func(ctx context.Context) ([]DumpFile, error)) *Service {
 	prom := newPromMetrics()
 	svc := &Service{
-		cfg:     cfg,
-		client:  client,
-		sink:    sink,
-		lister:  lister,
-		status:  newStatusFile(cfg.StatusFile),
-		metrics: metricsState{Status: "idle"},
-		prom:    prom,
-		openZim: openZimArchive,
+		cfg:       cfg,
+		client:    client,
+		sink:      sink,
+		listDumps: listFunc,
+		status:    newStatusFile(cfg.StatusFile),
+		metrics:   metricsState{},
+		prom:      prom,
+		openZim:   openZimArchive,
 	}
 	svc.cond = sync.NewCond(&svc.mu)
 	prom.update(svc.metrics)
@@ -261,26 +157,10 @@ func NewServiceWithLister(cfg config.Config, client *http.Client, sink Sink, lis
 }
 
 func (s *Service) Start(ctx context.Context) error {
-	s.mu.Lock()
-	if s.running {
-		if s.paused {
-			log.Printf("resuming export")
-			s.paused = false
-			s.metrics.Status = "running"
-			s.cond.Broadcast()
-			s.mu.Unlock()
-			return nil
-		}
-		s.mu.Unlock()
-		return ErrExportRunning
-	}
-	s.mu.Unlock()
-
-	state, queue, err := s.prepareJob(ctx)
+	state, err := s.prepareState(ctx)
 	if err != nil {
 		return err
 	}
-	pending := len(queue)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -288,62 +168,40 @@ func (s *Service) Start(ctx context.Context) error {
 		return ErrExportRunning
 	}
 	s.state = state
-	s.queue = queue
-	totalLangs, processedLangs := languageStats(state)
-	s.metrics = metricsState{
-		Status:             "running",
-		TotalFiles:         len(state.Files),
-		ProcessedFiles:     len(state.Completed),
-		TotalLanguages:     totalLangs,
-		ProcessedLanguages: processedLangs,
-		Progress:           s.progressLocked(),
-		DownloadErrors:     0,
-		ReadErrors:         0,
-		ProcessedPages:     0,
-	}
-	s.startTime = time.Now()
+	s.metrics.Progress = s.progressLocked()
+	s.metrics.Running = true
 	s.running = true
-	s.paused = false
 	runCtx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
-	s.done = make(chan struct{})
 
 	go s.run(runCtx)
-	log.Printf("export starting with %d pending files", pending)
+	log.Printf("export starting with %d pending files", len(state.Pending))
 	return nil
 }
 
-func (s *Service) prepareJob(ctx context.Context) (exportState, []DumpFile, error) {
+func (s *Service) prepareState(ctx context.Context) (exportState, error) {
 	state, err := s.status.Load()
 	if err != nil {
-		return exportState{}, nil, err
+		return exportState{}, err
 	}
 	if len(state.Pending) == 0 {
 		state, err = s.buildFreshState(ctx)
 		if err != nil {
-			return exportState{}, nil, err
+			return exportState{}, err
 		}
 	}
-	queue := stateQueue(state)
-	if len(queue) == 0 && len(state.Pending) > 0 {
-		state, err = s.buildFreshState(ctx)
-		if err != nil {
-			return exportState{}, nil, err
-		}
-		queue = stateQueue(state)
-	}
-	return state, queue, nil
+	return state, nil
 }
 
 func (s *Service) buildFreshState(ctx context.Context) (exportState, error) {
-        files, err := s.lister.List(ctx)
-        if err != nil {
-                return exportState{}, err
-        }
-        files = append([]DumpFile(nil), files...)
-        sort.Slice(files, func(i, j int) bool {
-                if files[i].Language == files[j].Language {
-                        return files[i].Name < files[j].Name
+	files, err := s.listDumps(ctx)
+	if err != nil {
+		return exportState{}, err
+	}
+	files = append([]DumpFile(nil), files...)
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].Language == files[j].Language {
+			return files[i].Name < files[j].Name
 		}
 		return files[i].Language < files[j].Language
 	})
@@ -363,16 +221,21 @@ func (s *Service) buildFreshState(ctx context.Context) (exportState, error) {
 
 func (s *Service) Pause() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if !s.running {
+		s.mu.Unlock()
 		return ErrExportNotRunning
 	}
-	if s.paused {
-		return nil
-	}
+	cancel := s.cancel
+	s.mu.Unlock()
+
 	log.Printf("pausing export")
-	s.paused = true
-	s.metrics.Status = "paused"
+	cancel()
+
+	s.mu.Lock()
+	for s.running {
+		s.cond.Wait()
+	}
+	s.mu.Unlock()
 	return nil
 }
 
@@ -382,42 +245,32 @@ func (s *Service) Abort() error {
 		s.mu.Unlock()
 		return ErrExportNotRunning
 	}
-	log.Printf("aborting export")
 	cancel := s.cancel
-	done := s.done
-	s.paused = false
-	s.cond.Broadcast()
 	s.mu.Unlock()
 
+	log.Printf("aborting export")
 	cancel()
-	<-done
+
+	s.mu.Lock()
+	for s.running {
+		s.cond.Wait()
+	}
+	s.mu.Unlock()
 	return nil
 }
 
-func (s *Service) List() ListResult {
+func (s *Service) List() exportState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	processed := make([]string, 0, len(s.state.Completed))
-	for _, name := range s.state.Completed {
-		if file, ok := s.state.Files[name]; ok {
-			processed = append(processed, file.URL)
-		}
-	}
-	pending := make([]string, 0, len(s.state.Pending))
-	for _, name := range s.state.Pending {
-		if file, ok := s.state.Files[name]; ok {
-			pending = append(pending, file.URL)
-		}
-	}
-	return ListResult{Processed: processed, Pending: pending}
+	return cloneState(s.state)
 }
 
 func (s *Service) ListAll(ctx context.Context) (ListAllResult, error) {
-        files, err := s.lister.List(ctx)
-        if err != nil {
-                return ListAllResult{Errors: []string{err.Error()}}, err
-        }
-        return ListAllResult{Files: files}, nil
+	files, err := s.listDumps(ctx)
+	if err != nil {
+		return ListAllResult{Errors: []string{err.Error()}}, err
+	}
+	return ListAllResult{Files: files}, nil
 }
 
 func (s *Service) MetricsHandler() http.Handler {
@@ -434,82 +287,47 @@ func (s *Service) snapshotMetrics() metricsState {
 
 	m := s.metrics
 	m.Progress = s.progressLocked()
-	if s.running {
-		elapsed := time.Since(s.startTime)
-		m.Elapsed = elapsed
-		if m.ProcessedFiles > 0 && m.TotalFiles > 0 {
-			perFile := elapsed / time.Duration(m.ProcessedFiles)
-			remaining := m.TotalFiles - m.ProcessedFiles
-			if remaining > 0 {
-				m.ETA = time.Duration(int64(perFile) * int64(remaining))
-			} else {
-				m.ETA = 0
-			}
-		} else {
-			m.ETA = 0
-		}
-	} else {
-		m.Elapsed = 0
-		m.ETA = 0
-	}
 	s.metrics = m
 	return m
-}
-
-func (s *Service) Wait() {
-	s.mu.Lock()
-	done := s.done
-	running := s.running
-	s.mu.Unlock()
-	if !running {
-		return
-	}
-	<-done
 }
 
 func (s *Service) run(ctx context.Context) {
 	defer func() {
 		s.mu.Lock()
 		s.running = false
-		s.paused = false
+		s.metrics.Running = false
 		s.metrics.Progress = s.progressLocked()
-		if ctx.Err() != nil {
-			s.metrics.Status = "aborted"
-		} else if s.metrics.Status != "aborted" {
-			if len(s.state.Pending) == 0 {
-				s.metrics.Status = "completed"
-			} else {
-				s.metrics.Status = "idle"
-			}
-		}
-		close(s.done)
+		s.cancel = nil
+		s.cond.Broadcast()
 		s.mu.Unlock()
 	}()
 
-	for len(s.queue) > 0 {
-		s.mu.Lock()
-		for s.paused {
-			s.cond.Wait()
-		}
-		if ctx.Err() != nil {
-			s.mu.Unlock()
+	for {
+		file, ok := s.nextPending()
+		if !ok {
 			return
 		}
-		file := s.queue[0]
-		s.queue = s.queue[1:]
-		s.mu.Unlock()
-
 		if err := s.handleFile(ctx, file); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return
 			}
 			log.Printf("fatal error handling %s: %v", file.Name, err)
-			s.mu.Lock()
-			s.metrics.Status = "aborted"
-			s.mu.Unlock()
 			return
 		}
 	}
+}
+
+func (s *Service) nextPending() (DumpFile, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for len(s.state.Pending) > 0 {
+		name := s.state.Pending[0]
+		if file, ok := s.state.Files[name]; ok {
+			return file, true
+		}
+		s.state.Pending = s.state.Pending[1:]
+	}
+	return DumpFile{}, false
 }
 
 func (s *Service) handleFile(ctx context.Context, file DumpFile) error {
@@ -525,9 +343,6 @@ func (s *Service) handleFile(ctx context.Context, file DumpFile) error {
 			if errors.Is(err, context.Canceled) {
 				return err
 			}
-			s.mu.Lock()
-			s.metrics.DownloadErrors++
-			s.mu.Unlock()
 			log.Printf("download error for %s: %v", file.URL, err)
 			if !sleepWithContext(ctx, downloadRetry) {
 				return context.Canceled
@@ -546,9 +361,6 @@ func (s *Service) handleFile(ctx context.Context, file DumpFile) error {
 			if errors.Is(err, context.Canceled) {
 				return err
 			}
-			s.mu.Lock()
-			s.metrics.ReadErrors++
-			s.mu.Unlock()
 			log.Printf("processing error for %s: %v", file.Name, err)
 			if !sleepWithContext(ctx, readRetry) {
 				return context.Canceled
@@ -573,12 +385,8 @@ func (s *Service) markFileDone(file DumpFile) error {
 	}
 	s.state.Pending = removeName(s.state.Pending, file.Name)
 	s.state.Completed = append(s.state.Completed, file.Name)
-	s.metrics.ProcessedFiles = len(s.state.Completed)
-	totalLangs, processedLangs := languageStats(s.state)
-	s.metrics.TotalLanguages = totalLangs
-	s.metrics.ProcessedLanguages = processedLangs
 	s.metrics.Progress = s.progressLocked()
-	stateCopy := s.state
+	stateCopy := cloneState(s.state)
 	s.mu.Unlock()
 	return s.status.Save(stateCopy)
 }
@@ -627,10 +435,10 @@ func (s *Service) processDump(ctx context.Context, path string, file DumpFile) e
 	}
 	defer archive.Close()
 
-	return processZimArchive(ctx, archive, file, s.sink, &s.mu, &s.metrics)
+	return processZimArchive(ctx, archive, file, s.sink)
 }
 
-func processZimArchive(ctx context.Context, archive zimArchive, file DumpFile, sink Sink, mu *sync.Mutex, metrics *metricsState) error {
+func processZimArchive(ctx context.Context, archive zimArchive, file DumpFile, sink Sink) error {
 	return archive.Walk(ctx, func(entry zimEntry) error {
 		if !isArticleEntry(entry) {
 			return nil
@@ -679,11 +487,6 @@ func processZimArchive(ctx context.Context, archive zimArchive, file DumpFile, s
 				continue
 			}
 			break
-		}
-		if mu != nil && metrics != nil {
-			mu.Lock()
-			metrics.ProcessedPages++
-			mu.Unlock()
 		}
 		return nil
 	})
@@ -983,7 +786,7 @@ func ConvertFile(ctx context.Context, cfg config.Config, sink Sink, path string)
 		version = ver
 	}
 	file := DumpFile{Name: name, Language: lang, Dataset: dataset, Version: version}
-	return processZimArchive(ctx, archive, file, sink, nil, nil)
+	return processZimArchive(ctx, archive, file, sink)
 }
 
 func buildPageURL(lang, title string) string {
@@ -1005,19 +808,6 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func countProcessedLanguages(total, done map[string]int) int {
-	processed := 0
-	for lang, totalCount := range total {
-		if totalCount == 0 {
-			continue
-		}
-		if done[lang] >= totalCount {
-			processed++
-		}
-	}
-	return processed
-}
-
 func (s *Service) progressLocked() float64 {
 	total := len(s.state.Files)
 	if total == 0 {
@@ -1028,32 +818,6 @@ func (s *Service) progressLocked() float64 {
 		completed = total
 	}
 	return float64(completed) / float64(total)
-}
-
-func stateQueue(state exportState) []DumpFile {
-	queue := make([]DumpFile, 0, len(state.Pending))
-	for _, name := range state.Pending {
-		if file, ok := state.Files[name]; ok {
-			queue = append(queue, file)
-		}
-	}
-	return queue
-}
-
-func languageStats(state exportState) (total, processed int) {
-	totals := make(map[string]int)
-	done := make(map[string]int)
-	for _, file := range state.Files {
-		totals[file.Language]++
-	}
-	for _, name := range state.Completed {
-		if file, ok := state.Files[name]; ok {
-			done[file.Language]++
-		}
-	}
-	total = len(totals)
-	processed = countProcessedLanguages(totals, done)
-	return
 }
 
 func removeName(list []string, name string) []string {
@@ -1073,4 +837,16 @@ func containsName(list []string, name string) bool {
 		}
 	}
 	return false
+}
+
+func cloneState(src exportState) exportState {
+	files := make(map[string]DumpFile, len(src.Files))
+	for k, v := range src.Files {
+		files[k] = v
+	}
+	return exportState{
+		Files:     files,
+		Pending:   append([]string(nil), src.Pending...),
+		Completed: append([]string(nil), src.Completed...),
+	}
 }

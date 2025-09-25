@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/example/wikipedia-parser/internal/config"
 	"github.com/example/wikipedia-parser/internal/pageproto"
@@ -114,7 +115,7 @@ func TestServiceRun(t *testing.T) {
 	if err := svc.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	svc.Wait()
+	waitForIdle(t, svc)
 
 	expected := map[string]string{
 		"https://en.wikipedia.org/wiki/Alpha":   "<html>alpha</html>",
@@ -145,8 +146,8 @@ func TestServiceRun(t *testing.T) {
 	if len(list.Pending) != 0 {
 		t.Fatalf("expected no pending files, got %v", list.Pending)
 	}
-	if len(list.Processed) != 3 {
-		t.Fatalf("expected 3 processed files, got %v", list.Processed)
+	if len(list.Completed) != 3 {
+		t.Fatalf("expected 3 completed files, got %v", list.Completed)
 	}
 
 	data, err := os.ReadFile(cfg.StatusFile)
@@ -206,9 +207,20 @@ func TestServiceRun(t *testing.T) {
 	if err := svc2.Start(context.Background()); err != nil {
 		t.Fatalf("restart: %v", err)
 	}
-	svc2.Wait()
+	waitForIdle(t, svc2)
 	if len(sink.pages) != 12 {
 		t.Fatalf("expected pages to be re-exported, got %d", len(sink.pages))
+	}
+}
+
+func waitForIdle(t *testing.T, svc *Service) {
+	t.Helper()
+	for {
+		metrics := svc.snapshotMetrics()
+		if !metrics.Running && metrics.Progress >= 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

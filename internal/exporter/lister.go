@@ -13,11 +13,12 @@ import (
 	"strings"
 )
 
-func NewHTTPDumpLister(baseURL string, client *http.Client) DumpLister {
+func NewHTTPDumpLister(baseURL string, client *http.Client) func(ctx context.Context) ([]DumpFile, error) {
 	// Trim the trailing slash so url.JoinPath doesn't introduce double separators
 	// when we later append file names. A bare root URL ("/") remains untouched.
 	base := strings.TrimSuffix(baseURL, "/")
-	return &httpLister{base: base, client: client}
+	l := &httpLister{base: base, client: client}
+	return l.List
 }
 
 type httpLister struct {

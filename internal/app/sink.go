@@ -3,8 +3,10 @@ package app
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/segmentio/kafka-go"
+	kafkacompress "github.com/segmentio/kafka-go/compress"
 
 	"github.com/example/wikipedia-parser/internal/config"
 	"github.com/example/wikipedia-parser/internal/exporter"
@@ -17,13 +19,24 @@ func BuildSink(cfg config.Config) (exporter.Sink, func(), error) {
 	case "stdout":
 		return stdoutSink{}, func() {}, nil
 	case "kafka":
-		writer := &kafka.Writer{
-			Addr:                   kafka.TCP(cfg.KafkaBroker),
-			Topic:                  cfg.KafkaTopic,
-			AllowAutoTopicCreation: false,
-			BatchSize:              1,
-			RequiredAcks:           kafka.RequireAll,
+		brokers := cfg.KafkaBroker
+		if len(brokers) == 0 {
+			return nil, nil, fmt.Errorf("kafka brokers are not configured")
 		}
+		topic := cfg.KafkaTopic
+		writer := kafka.NewWriter(kafka.WriterConfig{
+			Brokers:                brokers,
+			Topic:                  topic,
+			AllowAutoTopicCreation: false,
+			BatchSize:              100000,
+			BatchBytes:             100000000,
+			BatchTimeout:           time.Second,
+			RequiredAcks:           kafka.RequireAll,
+			CompressionCodec:       &kafkacompress.SnappyCodec,
+			MaxAttempts:            11,
+			QueueCapacity:          10000000,
+		})
+		writer.AllowAutoTopicCreation = false
 		return kafkaSink{writer: writer}, func() { writer.Close() }, nil
 	default:
 		return nil, nil, fmt.Errorf("unknown sink %q", cfg.Sink)

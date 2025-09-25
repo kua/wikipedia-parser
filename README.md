@@ -6,7 +6,8 @@ Copy `config.example.yml` to `config.yml` (or pass a custom path via `-config`) 
 
 ```yaml
 dump_base_url: https://dumps.wikimedia.org/kiwix/zim/wikipedia
-kafka_broker: localhost:9092
+kafka_broker:
+  - localhost:9092
 kafka_topic: wikipedia-pages
 work_dir: ./data
 status_file: ./data/status.log

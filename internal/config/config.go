@@ -10,13 +10,13 @@ import (
 )
 
 type Config struct {
-	DumpBaseURL string `yaml:"dump_base_url" default:"https://dumps.wikimedia.org/kiwix/zim/wikipedia"`
-	KafkaBroker string `yaml:"kafka_broker" default:"localhost:9092"`
-	KafkaTopic  string `yaml:"kafka_topic" default:"wikipedia-pages"`
-	WorkDir     string `yaml:"work_dir" default:"./data"`
-	HTTPAddr    string `yaml:"http_addr" default:":8080"`
-	Sink        string `yaml:"sink" default:"kafka"`
-	StatusFile  string `yaml:"status_file" default:"status.log"`
+	DumpBaseURL string   `yaml:"dump_base_url" default:"https://dumps.wikimedia.org/kiwix/zim/wikipedia"`
+	KafkaBroker []string `yaml:"kafka_broker"`
+	KafkaTopic  string   `yaml:"kafka_topic" default:"wikipedia-pages"`
+	WorkDir     string   `yaml:"work_dir" default:"./data"`
+	HTTPAddr    string   `yaml:"http_addr" default:":8080"`
+	Sink        string   `yaml:"sink" default:"kafka"`
+	StatusFile  string   `yaml:"status_file" default:"status.log"`
 }
 
 func Load(path string) (Config, error) {
@@ -33,8 +33,14 @@ func Load(path string) (Config, error) {
 	}
 	switch cfg.Sink {
 	case "kafka":
+		if len(cfg.KafkaBroker) == 0 {
+			cfg.KafkaBroker = []string{"localhost:9092"}
+		}
+		if cfg.KafkaTopic == "" {
+			cfg.KafkaTopic = "wikipedia-pages"
+		}
 	case "stdout":
-		cfg.KafkaBroker = ""
+		cfg.KafkaBroker = nil
 		cfg.KafkaTopic = ""
 	default:
 		return Config{}, fmt.Errorf("unknown sink %q", cfg.Sink)

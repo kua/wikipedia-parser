@@ -28,7 +28,7 @@ func (l *httpLister) List(ctx context.Context) (Inventory, error) {
 	if err != nil {
 		return Inventory{}, err
 	}
-	latest := make(map[string]DumpFile)
+	latestByDataset := make(map[string]DumpFile)
 	errs := make([]string, 0)
 	for _, link := range links {
 		file, ok := l.parseRootEntry(link)
@@ -42,15 +42,27 @@ func (l *httpLister) List(ctx context.Context) (Inventory, error) {
 			continue
 		}
 		file.URL = abs
-		current, exists := latest[file.Dataset]
+		current, exists := latestByDataset[file.Dataset]
 		if !exists || versionLess(current.Version, file.Version) {
-			latest[file.Dataset] = file
+			latestByDataset[file.Dataset] = file
 		}
 	}
 
-	files := make([]DumpFile, 0, len(latest))
-	langSet := make(map[string]struct{}, len(latest))
-	for _, file := range latest {
+	langMaxVersion := make(map[string]string)
+	for _, file := range latestByDataset {
+		maxVersion, exists := langMaxVersion[file.Language]
+		if !exists || versionLess(maxVersion, file.Version) {
+			langMaxVersion[file.Language] = file.Version
+		}
+	}
+
+	files := make([]DumpFile, 0, len(latestByDataset))
+	langSet := make(map[string]struct{}, len(latestByDataset))
+	for _, file := range latestByDataset {
+		maxVersion, ok := langMaxVersion[file.Language]
+		if !ok || file.Version != maxVersion {
+			continue
+		}
 		files = append(files, file)
 		langSet[file.Language] = struct{}{}
 	}

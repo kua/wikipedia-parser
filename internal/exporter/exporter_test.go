@@ -72,13 +72,15 @@ func TestServiceRun(t *testing.T) {
 		reqLog.mu.Unlock()
 		switch r.URL.Path {
 		case "/kiwix/zim/wikipedia/":
-			w.Write([]byte(`<a href="wikipedia_en_history_nopic_2024-01.zim">en-history</a><a href="wikipedia_en_all_nopic_2024-01.zim">skip-all</a><a href="wikipedia_ru_science_nopic_2024-01.zim">ru-science</a><a href="wikipedia_ar_basketball_nopic_2025-08.zim">ar-basketball-old</a><a href="wikipedia_ar_basketball_nopic_2025-09.zim">ar-basketball-new</a><a href="speedtest_en_blob_2024-05.zim">speed</a>`))
+			w.Write([]byte(`<a href="wikipedia_en_history_nopic_2024-01.zim">en-history</a><a href="wikipedia_en_all_nopic_2024-01.zim">skip-all</a><a href="wikipedia_ru_science_nopic_2024-01.zim">ru-science</a><a href="wikipedia_en_science_nopic_2023-12.zim">en-science-old</a><a href="wikipedia_ar_basketball_nopic_2025-08.zim">ar-basketball-old</a><a href="wikipedia_ar_basketball_nopic_2025-09.zim">ar-basketball-new</a><a href="speedtest_en_blob_2024-05.zim">speed</a>`))
 		case "/kiwix/zim/wikipedia/wikipedia_en_history_nopic_2024-01.zim":
 			w.Write([]byte("zimdata"))
 		case "/kiwix/zim/wikipedia/wikipedia_en_all_nopic_2024-01.zim":
 			http.Error(w, "should not fetch", http.StatusBadRequest)
 		case "/kiwix/zim/wikipedia/wikipedia_ru_science_nopic_2024-01.zim":
 			w.Write([]byte("zimdata"))
+		case "/kiwix/zim/wikipedia/wikipedia_en_science_nopic_2023-12.zim":
+			http.Error(w, "old language version", http.StatusBadRequest)
 		case "/kiwix/zim/wikipedia/wikipedia_ar_basketball_nopic_2025-08.zim":
 			http.Error(w, "old version", http.StatusBadRequest)
 		case "/kiwix/zim/wikipedia/wikipedia_ar_basketball_nopic_2025-09.zim":
@@ -185,6 +187,9 @@ func TestServiceRun(t *testing.T) {
 	}
 	if _, ok := reqLog.agent["/kiwix/zim/wikipedia/wikipedia_ar_basketball_nopic_2025-08.zim"]; ok {
 		t.Fatalf("unexpected request for old dump version")
+	}
+	if _, ok := reqLog.agent["/kiwix/zim/wikipedia/wikipedia_en_science_nopic_2023-12.zim"]; ok {
+		t.Fatalf("unexpected request for older language version")
 	}
 
 	metricsReq := httptest.NewRecorder()

@@ -3,6 +3,7 @@ module github.com/example/wikipedia-parser
 go 1.23.0
 
 require (
+	github.com/creasty/defaults v1.7.0
 	github.com/klauspost/compress v1.18.0
 	github.com/prometheus/client_golang v1.19.1
 	github.com/segmentio/kafka-go v0.4.49

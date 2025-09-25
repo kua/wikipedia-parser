@@ -4,19 +4,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
+	"github.com/creasty/defaults"
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	DumpBaseURL string `yaml:"dump_base_url"`
-	KafkaBroker string `yaml:"kafka_broker"`
-	KafkaTopic  string `yaml:"kafka_topic"`
-	WorkDir     string `yaml:"work_dir"`
-	HTTPAddr    string `yaml:"http_addr"`
-	Sink        string `yaml:"sink"`
-	StatusFile  string `yaml:"status_file"`
+	DumpBaseURL string `yaml:"dump_base_url" default:"https://dumps.wikimedia.org/kiwix/zim/wikipedia"`
+	KafkaBroker string `yaml:"kafka_broker" default:"localhost:9092"`
+	KafkaTopic  string `yaml:"kafka_topic" default:"wikipedia-pages"`
+	WorkDir     string `yaml:"work_dir" default:"./data"`
+	HTTPAddr    string `yaml:"http_addr" default:":8080"`
+	Sink        string `yaml:"sink" default:"kafka"`
+	StatusFile  string `yaml:"status_file" default:"status.log"`
 }
 
 func Load(path string) (Config, error) {
@@ -24,43 +24,23 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
 	}
-	cfg := Config{HTTPAddr: ":8080", Sink: "kafka"}
+	var cfg Config
+	if err := defaults.Set(&cfg); err != nil {
+		return Config{}, fmt.Errorf("set default config values: %w", err)
+	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
-	missing := make([]string, 0)
-	if cfg.DumpBaseURL == "" {
-		missing = append(missing, "dump_base_url")
-	}
-	if cfg.WorkDir == "" {
-		missing = append(missing, "work_dir")
-	}
-	if len(missing) > 0 {
-		return Config{}, fmt.Errorf("missing %s", strings.Join(missing, ", "))
-	}
-	if cfg.Sink == "" {
-		cfg.Sink = "kafka"
-	}
 	switch cfg.Sink {
 	case "kafka":
-		kafkaMissing := make([]string, 0)
-		if cfg.KafkaBroker == "" {
-			kafkaMissing = append(kafkaMissing, "kafka_broker")
-		}
-		if cfg.KafkaTopic == "" {
-			kafkaMissing = append(kafkaMissing, "kafka_topic")
-		}
-		if len(kafkaMissing) > 0 {
-			return Config{}, fmt.Errorf("missing %s", strings.Join(kafkaMissing, ", "))
-		}
 	case "stdout":
 		cfg.KafkaBroker = ""
 		cfg.KafkaTopic = ""
 	default:
 		return Config{}, fmt.Errorf("unknown sink %q", cfg.Sink)
 	}
-	if cfg.StatusFile == "" {
-		cfg.StatusFile = filepath.Join(cfg.WorkDir, "status.log")
+	if cfg.StatusFile != "" && !filepath.IsAbs(cfg.StatusFile) {
+		cfg.StatusFile = filepath.Join(cfg.WorkDir, cfg.StatusFile)
 	}
 	return cfg, nil
 }

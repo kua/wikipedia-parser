@@ -1,12 +1,11 @@
 package exporter
 
 import (
-	"bufio"
+	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
 	"context"
 	"encoding/binary"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -21,11 +20,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	xz "github.com/xi2/xz"
 
 	"github.com/example/wikipedia-parser/internal/config"
 	"github.com/example/wikipedia-parser/internal/pageproto"
+	libzim "github.com/example/wikipedia-parser/internal/zim"
 )
 
 const (
@@ -56,6 +58,8 @@ type DumpFile struct {
 	Name     string `json:"name"`
 	URL      string `json:"url"`
 	Language string `json:"language"`
+	Dataset  string `json:"dataset,omitempty"`
+	Version  string `json:"version,omitempty"`
 }
 
 type Inventory struct {
@@ -226,6 +230,8 @@ type Service struct {
 	status *statusFile
 	prom   *promMetrics
 
+	openZim zimOpener
+
 	mu        sync.Mutex
 	cond      *sync.Cond
 	running   bool
@@ -253,6 +259,7 @@ func NewServiceWithLister(cfg config.Config, client *http.Client, sink Sink, lis
 		status:  newStatusFile(cfg.StatusFile),
 		metrics: metricsState{Status: "idle"},
 		prom:    prom,
+		openZim: openZimArchive,
 	}
 	svc.cond = sync.NewCond(&svc.mu)
 	prom.update(svc.metrics)
@@ -620,40 +627,46 @@ func (s *Service) download(ctx context.Context, src, dest string) error {
 }
 
 func (s *Service) processDump(ctx context.Context, path string, file DumpFile) error {
-	reader, err := openDump(path)
+	archive, err := s.openZim(path)
 	if err != nil {
 		return err
 	}
-	defer reader.Close()
+	defer archive.Close()
 
-	decoder := xml.NewDecoder(bufio.NewReader(reader))
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	return processZimArchive(ctx, archive, file, s.sink, &s.mu, &s.metrics)
+}
+
+func processZimArchive(ctx context.Context, archive zimArchive, file DumpFile, sink Sink, mu *sync.Mutex, metrics *metricsState) error {
+	return archive.Walk(ctx, func(entry zimEntry) error {
+		if !isArticleEntry(entry) {
+			return nil
 		}
-		token, err := decoder.Token()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-		start, ok := token.(xml.StartElement)
-		if !ok || start.Name.Local != "page" {
-			continue
-		}
-		var page xmlPage
-		if err := decoder.DecodeElement(&page, &start); err != nil {
-			return err
-		}
-		title := strings.TrimSpace(page.Title)
+		title := strings.TrimSpace(entry.Title())
 		if title == "" {
-			continue
+			return nil
+		}
+		key := articleKey(entry)
+		if key == "" {
+			return nil
+		}
+		content, err := entry.Data()
+		if err != nil {
+			return err
+		}
+		content, err = normalizeHTMLContent(content)
+		if err != nil {
+			return err
+		}
+		if len(bytes.TrimSpace(content)) == 0 {
+			return nil
+		}
+		if !isProbablyHTML(content) {
+			return nil
 		}
 		payload := &pageproto.Page{
 			SrcUrl:   buildPageURL(file.Language, title),
 			HttpCode: 200,
-			Content:  []byte(page.Revision.Text.Value),
+			Content:  content,
 			Ip:       wikipediaIP(),
 		}
 		data, err := pageproto.Marshal(payload)
@@ -664,8 +677,8 @@ func (s *Service) processDump(ctx context.Context, path string, file DumpFile) e
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if err := s.sink.Send(ctx, []byte(title), data); err != nil {
-				log.Printf("sink error for %s: %v", title, err)
+			if err := sink.Send(ctx, []byte(key), data); err != nil {
+				log.Printf("sink error for %s: %v", key, err)
 				if !sleepWithContext(ctx, sendRetry) {
 					return context.Canceled
 				}
@@ -673,51 +686,311 @@ func (s *Service) processDump(ctx context.Context, path string, file DumpFile) e
 			}
 			break
 		}
-		s.mu.Lock()
-		s.metrics.ProcessedPages++
-		s.mu.Unlock()
+		if mu != nil && metrics != nil {
+			mu.Lock()
+			metrics.ProcessedPages++
+			mu.Unlock()
+		}
+		return nil
+	})
+}
+
+func isArticleEntry(entry zimEntry) bool {
+	if entry == nil {
+		return false
 	}
+	if entry.IsRedirect() {
+		return false
+	}
+	if !entry.HasItem() {
+		return false
+	}
+	mime := strings.ToLower(strings.TrimSpace(entry.MimeType()))
+	if mime == "" {
+		return false
+	}
+	if !strings.Contains(mime, "html") {
+		return false
+	}
+	title := strings.TrimSpace(entry.Title())
+	if title == "" {
+		return false
+	}
+	slug := strings.ToLower(strings.TrimSpace(articleSlug(entry)))
+	slug = strings.Trim(slug, "/")
+	base := slug
+	if base == "" {
+		base = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(title, " ", "_")))
+	}
+	if idx := strings.LastIndex(base, "/"); idx >= 0 {
+		base = base[idx+1:]
+	}
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return false
+	}
+	switch base {
+	case "readme", "metadata", "meta", "description", "favicon", "license", "copyright":
+		return false
+	}
+	return true
 }
 
-type xmlPage struct {
-	Title    string      `xml:"title"`
-	Revision xmlRevision `xml:"revision"`
+func articleKey(entry zimEntry) string {
+	slug := articleSlug(entry)
+	if slug == "" {
+		slug = entry.Title()
+	}
+	slug = strings.TrimSpace(slug)
+	if slug == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(slug, "/"); idx >= 0 {
+		slug = slug[idx+1:]
+	}
+	slug = strings.ReplaceAll(slug, " ", "_")
+	slug = strings.ReplaceAll(slug, "/", "_")
+	if slug == "" {
+		return ""
+	}
+	return slug
 }
 
-type xmlRevision struct {
-	Text xmlText `xml:"text"`
+func articleSlug(entry zimEntry) string {
+	url := entry.URL()
+	if url == "" {
+		return ""
+	}
+	if idx := strings.Index(url, "/"); idx >= 0 {
+		url = url[idx+1:]
+	}
+	if idx := strings.LastIndex(url, "/"); idx >= 0 {
+		url = url[idx+1:]
+	}
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return ""
+	}
+	if strings.HasPrefix(url, "wiki/") {
+		url = url[len("wiki/"):]
+	}
+	if idx := strings.Index(url, "?"); idx >= 0 {
+		url = url[:idx]
+	}
+	if idx := strings.Index(url, "#"); idx >= 0 {
+		url = url[:idx]
+	}
+	if idx := strings.LastIndex(url, "."); idx >= 0 {
+		ext := strings.ToLower(url[idx+1:])
+		if ext == "html" || ext == "htm" {
+			url = url[:idx]
+		}
+	}
+	return url
 }
 
-type xmlText struct {
-	Value string `xml:",chardata"`
+const maxContentDecodePasses = 3
+
+func normalizeHTMLContent(data []byte) ([]byte, error) {
+	var err error
+	for pass := 0; pass < maxContentDecodePasses; pass++ {
+		if isProbablyHTML(data) {
+			return data, nil
+		}
+		switch detectCompression(data) {
+		case "gzip":
+			var reader *gzip.Reader
+			reader, err = gzip.NewReader(bytes.NewReader(data))
+			if err != nil {
+				return nil, err
+			}
+			data, err = io.ReadAll(reader)
+			closeErr := reader.Close()
+			if err == nil && closeErr != nil {
+				err = closeErr
+			}
+		case "xz":
+			var xzr *xz.Reader
+			xzr, err = xz.NewReader(bytes.NewReader(data), 0)
+			if err != nil {
+				return nil, err
+			}
+			data, err = io.ReadAll(xzr)
+		case "zstd":
+			var dec *zstd.Decoder
+			dec, err = zstd.NewReader(bytes.NewReader(data))
+			if err != nil {
+				return nil, err
+			}
+			data, err = io.ReadAll(dec)
+			dec.Close()
+		case "bzip2":
+			data, err = io.ReadAll(bzip2.NewReader(bytes.NewReader(data)))
+		default:
+			return data, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return data, nil
 }
 
-func openDump(path string) (io.ReadCloser, error) {
-	file, err := os.Open(path)
+func detectCompression(data []byte) string {
+	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+		return "gzip"
+	}
+	if len(data) >= 6 && bytes.HasPrefix(data, []byte{0xFD, '7', 'z', 'X', 'Z', 0x00}) {
+		return "xz"
+	}
+	if len(data) >= 4 && bytes.HasPrefix(data, []byte{0x28, 0xB5, 0x2F, 0xFD}) {
+		return "zstd"
+	}
+	if len(data) >= 3 && bytes.HasPrefix(data, []byte{'B', 'Z', 'h'}) {
+		return "bzip2"
+	}
+	return ""
+}
+
+func isProbablyHTML(data []byte) bool {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return false
+	}
+	lower := bytes.ToLower(trimmed)
+	if trimmed[0] == '<' {
+		return true
+	}
+	return bytes.HasPrefix(lower, []byte("<!doctype")) || bytes.HasPrefix(lower, []byte("<?xml"))
+}
+
+type zimOpener func(path string) (zimArchive, error)
+
+type zimArchive interface {
+	Close() error
+	Walk(ctx context.Context, fn func(zimEntry) error) error
+}
+
+type zimEntry interface {
+	Title() string
+	URL() string
+	MimeType() string
+	Data() ([]byte, error)
+	IsRedirect() bool
+	HasItem() bool
+}
+
+func openZimArchive(path string) (zimArchive, error) {
+	file, err := libzim.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	switch {
-	case strings.HasSuffix(path, ".bz2"):
-		return &bzReader{Reader: bzip2.NewReader(file), Closer: file}, nil
-	case strings.HasSuffix(path, ".gz"):
-		gz, err := gzip.NewReader(file)
-		if err != nil {
-			file.Close()
-			return nil, err
-		}
-		return gz, nil
-	default:
-		return file, nil
+	return &libzimArchive{file: file}, nil
+}
+
+type libzimArchive struct {
+	file *libzim.Archive
+}
+
+func (a *libzimArchive) Close() error {
+	if a.file == nil {
+		return nil
 	}
+	err := a.file.Close()
+	a.file = nil
+	return err
 }
 
-type bzReader struct {
-	io.Reader
-	Closer io.Closer
+func (a *libzimArchive) Walk(ctx context.Context, fn func(zimEntry) error) error {
+	if a.file == nil {
+		return nil
+	}
+	total := a.file.EntryCount()
+	for idx := uint32(0); idx < total; idx++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		entry, err := a.file.EntryAt(idx)
+		if err != nil {
+			continue
+		}
+		current := &libzimEntry{entry: entry}
+		callErr := fn(current)
+		entry.Close()
+		if callErr != nil {
+			return callErr
+		}
+	}
+	return nil
 }
 
-func (b *bzReader) Close() error { return b.Closer.Close() }
+type libzimEntry struct {
+	entry *libzim.Entry
+}
+
+func (e *libzimEntry) Title() string {
+	if e == nil || e.entry == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.entry.Title())
+}
+
+func (e *libzimEntry) URL() string {
+	if e == nil || e.entry == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.entry.Path())
+}
+
+func (e *libzimEntry) MimeType() string {
+	if e == nil || e.entry == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.entry.MimeType(false))
+}
+
+func (e *libzimEntry) Data() ([]byte, error) {
+	if e == nil || e.entry == nil {
+		return nil, nil
+	}
+	return e.entry.Data()
+}
+
+func (e *libzimEntry) IsRedirect() bool {
+	if e == nil || e.entry == nil {
+		return false
+	}
+	return e.entry.IsRedirect()
+}
+
+func (e *libzimEntry) HasItem() bool {
+	if e == nil || e.entry == nil {
+		return false
+	}
+	return e.entry.HasItem()
+}
+
+func ConvertFile(ctx context.Context, cfg config.Config, sink Sink, path string) error {
+	archive, err := openZimArchive(path)
+	if err != nil {
+		return err
+	}
+	defer archive.Close()
+
+	name := filepath.Base(path)
+	lang := datasetLanguage(strings.TrimSuffix(name, ".zim"))
+	if lang == "" {
+		return fmt.Errorf("cannot determine language from %s", name)
+	}
+	dataset := strings.TrimSuffix(name, ".zim")
+	version := ""
+	if ds, ver, ok := splitDatasetVersion(name); ok {
+		dataset = ds
+		version = ver
+	}
+	file := DumpFile{Name: name, Language: lang, Dataset: dataset, Version: version}
+	return processZimArchive(ctx, archive, file, sink, nil, nil)
+}
 
 func buildPageURL(lang, title string) string {
 	slug := strings.ReplaceAll(title, " ", "_")
